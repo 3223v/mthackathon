@@ -1,0 +1,125 @@
+========================================
+活动规划Agent系统 - 启动命令
+========================================
+
+【方式一：分别启动前后端】
+
+1. 启动后端服务（FastAPI + LangGraph Agent）
+----------------------------------------
+cd backend
+python main.py
+
+后端服务地址: http://localhost:8000
+API文档地址: http://localhost:8000/docs
+
+
+2. 启动前端服务（Next.js）
+----------------------------------------
+cd frontend
+npm run dev
+
+前端服务地址: http://localhost:3000
+
+
+【方式二：使用PowerShell并行启动】
+
+# 在项目根目录执行
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd backend; python main.py"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd frontend; npm run dev"
+
+
+【方式三：使用批处理脚本（推荐）】
+
+创建 start.bat 文件：
+----------------------------------------
+@echo off
+echo 启动活动规划Agent系统...
+start cmd /k "cd backend && python main.py"
+start cmd /k "cd frontend && npm run dev"
+echo 后端: http://localhost:8000
+echo 前端: http://localhost:3000
+pause
+----------------------------------------
+
+
+【LLM配置说明】
+
+配置文件位置: backend/config/llm_config.json
+
+支持配置多个LLM，系统会自动使用轮询策略：
+----------------------------------------
+[
+  {
+    "name": "xiaomi",
+    "model": "mimo-v2.5-pro",
+    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "api_key": "your-api-key-here",
+    "temperature": 0.7
+  },
+  {
+    "name": "deepseek",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "your-api-key-here",
+    "temperature": 0.2
+  }
+]
+----------------------------------------
+
+配置要求：
+- 至少需要配置一个有效的API密钥
+- 如果API密钥为空，该LLM配置将被跳过
+- 系统会自动跳过无效配置
+
+重试策略：
+- 单次调用失败后会自动重试3次
+- 重试间隔：2秒 → 3秒 → 4.5秒（指数退避）
+- 每次重试会尝试下一个LLM配置
+
+
+【环境要求】
+
+后端：
+- Python 3.9+
+- 已安装依赖：pip install -r backend/requirements.txt
+- 必须配置LLM API密钥（不配置无法使用）
+
+前端：
+- Node.js 18+
+- 已安装依赖：npm install（在frontend目录）
+
+
+【配置文件】
+
+LLM配置：backend/config/llm_config.json
+提示词配置：backend/config/prompts.json
+数据存储：backend/data/
+
+
+【日志查看】
+
+后端日志：backend/logs/agent_YYYYMMDD.log
+实时查看：tail -f backend/logs/agent_*.log
+
+
+【停止服务】
+
+Ctrl + C 在对应的终端窗口
+
+
+【测试访问】
+
+1. 打开浏览器访问: http://localhost:3000
+2. 输入消息测试，例如：
+   - "我有个5岁的孩子，老婆在减肥"
+   - "带孩子出去玩"
+   - "和朋友聚会"
+
+
+【注意事项】
+
+⚠️ 重要：
+- 如果LLM配置不正确，系统会在对话中提示错误信息
+- 确保至少有一个LLM配置的api_key字段不为空
+- 多个LLM配置时，系统会自动轮询使用
+- 单个LLM调用失败时，会自动切换到下一个并重试

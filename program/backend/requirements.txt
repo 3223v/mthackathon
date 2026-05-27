@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn==0.32.0
+langgraph==0.2.45
+langchain==0.3.14
+langchain-openai==0.2.11
+python-multipart==0.0.12
+websockets==13.1

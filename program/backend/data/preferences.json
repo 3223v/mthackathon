@@ -1,0 +1,19 @@
+{
+  "preferences": {
+    "user_id": "default_user",
+    "preferences": "天下午是空的，想和老婆孩子/朋友出去玩几个小时，别离家太远，帮我安排一下",
+    "family_info": {
+      "has_children": true,
+      "children_ages": [
+        5
+      ],
+      "spouse_diet": "减肥中"
+    },
+    "friends_info": {
+      "total_count": 4,
+      "male_count": 2,
+      "female_count": 2
+    },
+    "update_time": "2026-05-27T22:27:45.385206"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "orders": [
+    {
+      "id": "order_001",
+      "plan_id": "plan_001",
+      "type": "ticket",
+      "target_name": "室内儿童乐园",
+      "quantity": 2,
+      "unit_price": 75,
+      "total_price": 150,
+      "status": "paid",
+      "confirmation_no": "TKT20240101001",
+      "created_at": "2024-01-01T10:32:00",
+      "updated_at": "2024-01-01T10:32:05"
+    },
+    {
+      "id": "order_002",
+      "plan_id": "plan_001",
+      "type": "reservation",
+      "target_name": "亲子餐厅",
+      "party_size": 3,
+      "scheduled_time": "17:30",
+      "status": "confirmed",
+      "confirmation_no": "RSV20240101002",
+      "notes": "需要儿童椅",
+      "created_at": "2024-01-01T10:33:00",
+      "updated_at": "2024-01-01T10:33:05"
+    }
+  ],
+  "next_id": 3
+}

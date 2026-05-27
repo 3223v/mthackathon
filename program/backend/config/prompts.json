@@ -1,0 +1,5 @@
+{
+  "system_prompt": "你是一个智能助手，帮助用户完成各种任务。你可以使用提供的 skills 来解决问题。",
+  "preference_prompt": "用户表达了以下偏好：{preferences}。请在回答中考虑这些偏好。",
+  "interrupt_prompt": "用户打断了对话，添加了新的信息：{new_info}。请结合之前的对话历史和新信息继续。"
+}

@@ -1,0 +1,56 @@
+{
+  "delivery_services": {
+    "cakes": [
+      {
+        "id": "cake_001",
+        "name": "水果奶油蛋糕",
+        "size": "6寸",
+        "price": 188,
+        "suitable_for": ["生日", "庆祝"],
+        "delivery_time": "约2小时"
+      },
+      {
+        "id": "cake_002",
+        "name": "巧克力慕斯蛋糕",
+        "size": "8寸",
+        "price": 288,
+        "suitable_for": ["生日", "纪念日", "约会"],
+        "delivery_time": "约2小时"
+      },
+      {
+        "id": "cake_003",
+        "name": "低糖酸奶蛋糕",
+        "size": "6寸",
+        "price": 218,
+        "suitable_for": ["减肥", "健康", "女性"],
+        "delivery_time": "约2小时"
+      }
+    ],
+    "flowers": [
+      {
+        "id": "flower_001",
+        "name": "玫瑰花束",
+        "type": "红玫瑰11支",
+        "price": 168,
+        "occasion": ["生日", "纪念日", "道歉"],
+        "delivery_time": "约1小时"
+      },
+      {
+        "id": "flower_002",
+        "name": "混搭小花束",
+        "type": "多色混搭",
+        "price": 128,
+        "occasion": ["探病", "探访", "日常"],
+        "delivery_time": "约1小时"
+      },
+      {
+        "id": "flower_003",
+        "name": "永生花礼盒",
+        "type": "高端定制",
+        "price": 388,
+        "occasion": ["纪念日", "求婚", "重要场合"],
+        "delivery_time": "约2小时"
+      }
+    ]
+  }
+}
