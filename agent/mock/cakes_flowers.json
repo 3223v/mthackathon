@@ -1,0 +1,54 @@
+{
+  "cakes": [
+    {
+      "id": "CK001",
+      "name": "水果奶油蛋糕（6寸）",
+      "price": 168,
+      "description": "新鲜水果+动物奶油，适合2-4人",
+      "delivery_time_hours": 3,
+      "suitable_for": ["亲子", "朋友", "情侣"]
+    },
+    {
+      "id": "CK002",
+      "name": "巧克力慕斯蛋糕（8寸）",
+      "price": 228,
+      "description": "浓郁巧克力，适合4-6人",
+      "delivery_time_hours": 3,
+      "suitable_for": ["朋友", "情侣"]
+    },
+    {
+      "id": "CK003",
+      "name": "儿童卡通蛋糕（6寸）",
+      "price": 188,
+      "description": "可选小猪佩奇/奥特曼等卡通造型，孩子最爱",
+      "delivery_time_hours": 4,
+      "suitable_for": ["亲子"]
+    }
+  ],
+  "flowers": [
+    {
+      "id": "FL001",
+      "name": "向日葵混搭花束",
+      "price": 128,
+      "description": "向日葵+雏菊+满天星，阳光活泼",
+      "delivery_time_hours": 2,
+      "suitable_for": ["朋友", "亲子"]
+    },
+    {
+      "id": "FL002",
+      "name": "红玫瑰花束（11枝）",
+      "price": 168,
+      "description": "经典红玫瑰+尤加利叶，浪漫之选",
+      "delivery_time_hours": 2,
+      "suitable_for": ["情侣"]
+    },
+    {
+      "id": "FL003",
+      "name": "粉色康乃馨花束",
+      "price": 98,
+      "description": "康乃馨+百合，温馨感恩",
+      "delivery_time_hours": 2,
+      "suitable_for": ["亲子"]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "xiaomi",
+    "model": "mimo-v2.5-pro",
+    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "api_key": "tp-cr4otuy50dk3you5pg2mdyu1genmqhw6wi3x7u015zofjnep",
+    "temperature": 0.2
+  },
+  {
+    "name": "deepseek",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-13b1d107083245438fc8f625630555df",
+    "temperature": 0.2
+  }
+]

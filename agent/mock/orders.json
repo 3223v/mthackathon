@@ -1,0 +1,37 @@
+{
+  "orders": [],
+  "reservations": [],
+  "order_templates": {
+    "restaurant_reservation": {
+      "type": "餐厅预约",
+      "fields": ["restaurant_id", "restaurant_name", "date", "time", "party_size", "contact_name", "contact_phone", "need_kids_chair", "special_requests"],
+      "status_options": ["已预约", "排队中", "已取消"]
+    },
+    "ticket_purchase": {
+      "type": "门票购买",
+      "fields": ["attraction_id", "attraction_name", "date", "adult_count", "child_count", "total_price"],
+      "status_options": ["已出票", "待支付", "已取消"]
+    },
+    "activity_booking": {
+      "type": "活动预约",
+      "fields": ["activity_id", "activity_name", "date", "time", "participant_count", "contact_name", "contact_phone"],
+      "status_options": ["已预约", "待确认", "已取消"]
+    },
+    "movie_ticket": {
+      "type": "电影票",
+      "fields": ["movie_name", "cinema", "date", "showtime", "seat_count", "total_price"],
+      "status_options": ["已出票", "待支付", "已取消"]
+    },
+    "cake_delivery": {
+      "type": "蛋糕配送",
+      "fields": ["cake_type", "delivery_address", "delivery_time", "message_card", "total_price"],
+      "status_options": ["已下单", "配送中", "已送达"]
+    },
+    "flower_delivery": {
+      "type": "鲜花配送",
+      "fields": ["flower_type", "delivery_address", "delivery_time", "message_card", "total_price"],
+      "status_options": ["已下单", "配送中", "已送达"]
+    }
+  },
+  "order_id_counter": 10000
+}
