@@ -1,0 +1,29 @@
+[
+  {
+    "id": "OT001",
+    "name": "朝阳大悦城公共厕所",
+    "type": "toilet",
+    "location": {"lng": 116.521, "lat": 39.928},
+    "address": "商场每层均有",
+    "opening_hours": "同商场",
+    "tags": ["免费", "母婴室"]
+  },
+  {
+    "id": "OT002",
+    "name": "国大药房（青年路店）",
+    "type": "pharmacy",
+    "location": {"lng": 116.517, "lat": 39.922},
+    "address": "青年路29号",
+    "opening_hours": "08:00-22:00",
+    "tags": ["24小时", "医保"]
+  },
+  {
+    "id": "OT003",
+    "name": "中国石化加油站（姚家园路）",
+    "type": "gas_station",
+    "location": {"lng": 116.509, "lat": 39.935},
+    "address": "姚家园路甲1号",
+    "opening_hours": "24小时",
+    "tags": ["加油站", "便利店"]
+  }
+]

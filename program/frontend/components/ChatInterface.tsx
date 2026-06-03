@@ -11,9 +11,91 @@ interface Message {
 
 interface AgentLog {
   id: number;
-  type: 'thinking' | 'status' | 'skill_detected' | 'plan_created' | 'error' | 'preferences';
+  type: 'thinking' | 'status' | 'skill_detected' | 'plan_created' | 'error' | 'preferences' | 'plan_updated';
   content: string;
+  skillId?: string;
   timestamp: Date;
+}
+
+interface TimeSlot {
+  start: string;
+  end: string;
+}
+
+interface Location {
+  lat: number;
+  lng: number;
+  address?: string;
+  name?: string;
+}
+
+interface PreBook {
+  need: boolean;
+  type: string;
+  item: string;
+}
+
+interface ActivityDetails {
+  rating?: number;
+  price?: number;
+  tags?: string[];
+  description?: string;
+}
+
+interface PlanActivity {
+  order: number;
+  time_slot: TimeSlot;
+  activity_type: string;
+  name: string;
+  item_id?: string;
+  location?: Location;
+  duration_hours?: number;
+  duration_minutes?: number;
+  distance_m?: number;
+  mode?: string;
+  mode_label?: string;
+  mode_icon?: string;
+  from_location?: Location;
+  to_location?: Location;
+  details?: ActivityDetails;
+  pre_book?: PreBook;
+  notes?: string;
+}
+
+interface DagNode {
+  id: string;
+  type: 'activity' | 'alternative';
+  activity_index: number;
+  alternative_index?: number;
+  is_original: boolean;
+  activity: PlanActivity;
+  llm_score?: number;
+}
+
+interface DagEdge {
+  from: string;
+  to: string;
+  transport?: {
+    mode: string;
+    mode_label: string;
+    duration_minutes: number;
+    distance_m: number;
+  };
+}
+
+interface Dag {
+  plan_id: string;
+  nodes: DagNode[];
+  edges: DagEdge[];
+  recommended_path: string[];
+}
+
+interface ActivityAlternatives {
+  [key: number]: DagNode[];
+}
+
+interface OrderedItems {
+  [key: number]: boolean;
 }
 
 export default function ChatInterface() {
@@ -22,7 +104,33 @@ export default function ChatInterface() {
   const [input, setInput] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [currentPlanId, setCurrentPlanId] = useState<string | null>(null);
+  const [currentPlan, setCurrentPlan] = useState<PlanActivity[]>([]);
+  const [currentPlanId, setCurrentPlanId] = useState<string>('');
+  const [showPlanPanel, setShowPlanPanel] = useState(false);
+  const [streamingContent, setStreamingContent] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [lastError, setLastError] = useState<{ code: string; message: string; retry: boolean } | null>(null);
+
+  // Top-K 替代方案
+  const [dag, setDag] = useState<Dag | null>(null);
+  const [activityAlternatives, setActivityAlternatives] = useState<ActivityAlternatives>({});
+  const [selectedNodeIds, setSelectedNodeIds] = useState<{ [key: number]: string }>({});
+  const [isLoadingAlternatives, setIsLoadingAlternatives] = useState(false);
+
+  // 下单相关
+  const [showBookingForm, setShowBookingForm] = useState(false);
+  const [selectedItems, setSelectedItems] = useState<OrderedItems>({});
+  const [orderedItems, setOrderedItems] = useState<OrderedItems>({});
+  const [bookingData, setBookingData] = useState({
+    user_name: '',
+    phone: '',
+    date: new Date().toISOString().split('T')[0],
+    people: 2,
+  });
+  const [bookingFormError, setBookingFormError] = useState<string>('');
+  const [bookingFieldErrors, setBookingFieldErrors] = useState<{[key: string]: string}>({});
+  const [bookingResult, setBookingResult] = useState<{success: boolean; message: string; details?: string; orders?: any[]} | null>(null);
+  const [isBookingLoading, setIsBookingLoading] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -37,7 +145,7 @@ export default function ChatInterface() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, agentLogs]);
+  }, [messages, agentLogs, streamingContent]);
 
   useEffect(() => {
     const ws = new WebSocket('ws://localhost:8000/ws/chat');
@@ -45,6 +153,7 @@ export default function ChatInterface() {
     ws.onopen = () => {
       setIsConnected(true);
       addLog('status', '已连接到服务器');
+      setLastError(null);
     };
 
     ws.onmessage = (event) => {
@@ -60,68 +169,81 @@ export default function ChatInterface() {
           break;
 
         case 'skill_detected':
-          addLog('skill_detected', data.content);
+          addLog('skill_detected', data.content, data.skill_id);
           break;
 
         case 'plan_created':
           addLog('plan_created', data.content);
           break;
 
-        case 'preferences':
+        case 'plan_updated':
+          addLog('plan_updated', '方案已更新');
+          if (data.content) {
+            setCurrentPlan(data.content as PlanActivity[]);
+            if (data.plan_id) setCurrentPlanId(data.plan_id);
+          }
+          break;
+
+        case 'preference_update':
           addLog('preferences', data.content);
           break;
 
         case 'chunk':
-          setMessages(prev => {
-            const lastMsg = prev[prev.length - 1];
-            if (lastMsg && lastMsg.role === 'assistant') {
-              return [
-                ...prev.slice(0, -1),
-                { ...lastMsg, content: lastMsg.content + data.content }
-              ];
-            }
-            return [...prev, {
-              id: messageIdRef.current++,
-              role: 'assistant',
-              content: data.content,
-              timestamp: new Date()
-            }];
-          });
+          setIsStreaming(true);
+          setStreamingContent(prev => prev + data.content);
           break;
 
         case 'ai_message':
-          addLog('thinking', 'AI正在思考...');
+          setIsStreaming(false);
+          setStreamingContent('');
+          setMessages(prev => [...prev, {
+            id: messageIdRef.current++,
+            role: 'assistant',
+            content: data.content,
+            timestamp: new Date()
+          }]);
           break;
 
-        case 'skill_result':
-          setMessages(prev => {
-            const lastMsg = prev[prev.length - 1];
-            if (lastMsg && lastMsg.role === 'assistant') {
-              return [
-                ...prev.slice(0, -1),
-                { ...lastMsg, content: lastMsg.content + '\n' + data.content }
-              ];
-            }
-            return [...prev, {
-              id: messageIdRef.current++,
-              role: 'assistant',
-              content: data.content,
-              timestamp: new Date()
-            }];
-          });
+        case 'plan':
+          if (data.content && data.content.length > 0) {
+            setCurrentPlan(data.content as PlanActivity[]);
+            if (data.plan_id) setCurrentPlanId(data.plan_id);
+            setShowPlanPanel(true);
+            // 清空替代方案和已下单状态
+            setDag(null);
+            setActivityAlternatives({});
+            setSelectedNodeIds({});
+            setOrderedItems({});
+            setSelectedItems({});
+          }
           break;
 
         case 'done':
           setIsProcessing(false);
-          if (data.plan_id) {
-            setCurrentPlanId(data.plan_id);
+          setIsStreaming(false);
+          setStreamingContent('');
+          setLastError(null);
+          if (data.plan && data.plan.length > 0) {
+            setCurrentPlan(data.plan as PlanActivity[]);
+            if (data.plan_id) setCurrentPlanId(data.plan_id);
+            setShowPlanPanel(true);
           }
           break;
 
         case 'error':
-          addLog('error', data.content);
+          setLastError({
+            code: data.code,
+            message: data.message,
+            retry: data.retry || false,
+          });
+          addLog('error', `${data.code}: ${data.message}`);
           setIsProcessing(false);
+          setIsStreaming(false);
+          setStreamingContent('');
           break;
+
+        default:
+          console.log('未知消息类型:', data);
       }
     };
 
@@ -142,18 +264,19 @@ export default function ChatInterface() {
     };
   }, []);
 
-  const addLog = (type: AgentLog['type'], content: string) => {
+  const addLog = (type: AgentLog['type'], content: string, skillId?: string) => {
     setAgentLogs(prev => [...prev, {
       id: logIdRef.current++,
       type,
       content,
+      skillId,
       timestamp: new Date()
     }]);
   };
 
-  const sendMessage = async (e: React.FormEvent) => {
+  const sendMessage = async (e: React.FormEvent, messageType: 'message' | 'interrupt' = 'message') => {
     e.preventDefault();
-    if (!input.trim() || !wsRef.current || isProcessing) return;
+    if (!input.trim() || !wsRef.current) return;
 
     const userMessage = input.trim();
     setInput('');
@@ -165,34 +288,308 @@ export default function ChatInterface() {
       timestamp: new Date()
     }]);
 
+    if (messageType === 'message') {
+      setIsProcessing(true);
+      setLastError(null);
+    }
+    wsRef.current.send(JSON.stringify({ type: messageType, content: userMessage }));
+  };
+
+  const sendRetry = () => {
+    if (!wsRef.current) return;
     setIsProcessing(true);
-    wsRef.current.send(JSON.stringify({ type: 'message', content: userMessage }));
+    setLastError(null);
+    wsRef.current.send(JSON.stringify({ type: 'retry' }));
   };
 
-  const getLogIcon = (type: AgentLog['type']) => {
-    switch (type) {
-      case 'thinking': return '🤔';
-      case 'status': return '📡';
-      case 'skill_detected': return '⚡';
-      case 'plan_created': return '📋';
-      case 'preferences': return '⚙️';
-      case 'error': return '❌';
+  // ============== Top-K 替代方案 ==============
+
+  const loadAlternatives = async () => {
+    if (currentPlan.length === 0) return;
+    setIsLoadingAlternatives(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/api/plan/alternatives', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          plan_id: currentPlanId,
+          plan: currentPlan,
+          top_k: 3,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      const result = await response.json();
+      setDag(result);
+
+      // 按 activity_index 组织替代方案
+      const grouped: ActivityAlternatives = {};
+      const initialSelected: { [key: number]: string } = {};
+
+      result.nodes.forEach((node: DagNode) => {
+        const idx = node.activity_index;
+        if (!grouped[idx]) grouped[idx] = [];
+        grouped[idx].push(node);
+        if (node.is_original) initialSelected[idx] = node.id;
+      });
+
+      setActivityAlternatives(grouped);
+      setSelectedNodeIds(initialSelected);
+    } catch (error: any) {
+      console.error('加载替代方案失败:', error);
+      alert(`加载替代方案失败: ${error?.message || error?.detail || '请检查网络连接'}`);
+    } finally {
+      setIsLoadingAlternatives(false);
     }
   };
 
-  const getLogColor = (type: AgentLog['type']) => {
-    switch (type) {
-      case 'thinking': return 'text-blue-600';
-      case 'status': return 'text-gray-600';
-      case 'skill_detected': return 'text-purple-600';
-      case 'plan_created': return 'text-green-600';
-      case 'preferences': return 'text-orange-600';
-      case 'error': return 'text-red-600';
+  const selectAlternative = async (activityIndex: number, nodeId: string) => {
+    const newSelected = { ...selectedNodeIds, [activityIndex]: nodeId };
+    setSelectedNodeIds(newSelected);
+
+    if (!dag) return;
+
+    // 构造新的 selected_nodes 序列
+    const nonTransportActivities = currentPlan.filter(a => a.activity_type !== 'transport');
+    const selected_nodes: string[] = [];
+
+    // 找到正确的顺序
+    const sortedIndexes = Object.keys(newSelected).map(Number).sort((a, b) => a - b);
+    sortedIndexes.forEach(idx => {
+      selected_nodes.push(newSelected[idx]);
+    });
+
+    setIsProcessing(true);
+    try {
+      const response = await fetch('http://localhost:8000/api/plan/reroute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          plan_id: currentPlanId,
+          selected_nodes,
+          all_nodes: dag.nodes,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      const result = await response.json();
+      if (result.plan) {
+        setCurrentPlan(result.plan);
+        addLog('plan_updated', '已切换到替代方案');
+      } else {
+        throw new Error('返回数据不包含 plan');
+      }
+    } catch (error: any) {
+      console.error('重规划失败:', error);
+      alert(`切换方案失败: ${error?.message || '请重试'}`);
+    } finally {
+      setIsProcessing(false);
     }
   };
+
+  // 获取某个活动的当前选中替代方案索引
+  const getSelectedAlternativeIndex = (activityIndex: number): number => {
+    const alternatives = activityAlternatives[activityIndex];
+    if (!alternatives) return 0;
+    const selectedId = selectedNodeIds[activityIndex];
+    const idx = alternatives.findIndex(n => n.id === selectedId);
+    return idx >= 0 ? idx : 0;
+  };
+
+  // ============== 下单相关 ==============
+
+  const getBookableActivities = () => {
+    return currentPlan
+      .map((activity, index) => ({ activity, index }))
+      .filter(({ activity }) =>
+        activity.pre_book?.need && activity.activity_type !== 'transport'
+      );
+  };
+
+  const toggleSelectItem = (planIndex: number) => {
+    setSelectedItems(prev => ({
+      ...prev,
+      [planIndex]: !prev[planIndex]
+    }));
+  };
+
+  const selectAllUnordered = () => {
+    const bookable = getBookableActivities();
+    const newSelected: OrderedItems = {};
+    bookable.forEach(({ index }) => {
+      if (!orderedItems[index]) newSelected[index] = true;
+    });
+    setSelectedItems(newSelected);
+  };
+
+  const validateBookingForm = () => {
+    const errors: {[key: string]: string } = {};
+    if (!bookingData.user_name || bookingData.user_name.trim().length < 2) {
+      errors.user_name = '姓名至少2个字符';
+    }
+    const phoneRegex = /^1[3-9]\d{9}$/;
+    if (!bookingData.phone || !phoneRegex.test(bookingData.phone.trim())) {
+      errors.phone = '请输入正确的11位手机号';
+    }
+    if (!bookingData.date) {
+      errors.date = '请选择日期';
+    }
+    if (!bookingData.people || bookingData.people < 1 || bookingData.people > 20) {
+      errors.people = '人数应在1-20之间';
+    }
+    setBookingFieldErrors(errors);
+    return Object.keys(errors).length === 0;
+  };
+
+  const validateOrders = async () => {
+    if (!validateBookingForm()) return;
+
+    const bookable = getBookableActivities();
+    const selectedBookable = bookable.filter(({ index }) => selectedItems[index]);
+
+    if (selectedBookable.length === 0) {
+      setBookingFormError('请选择要预订的项目');
+      return;
+    }
+
+    setIsBookingLoading(true);
+    setBookingFormError('');
+    setBookingResult(null);
+
+    try {
+      const response = await fetch('http://localhost:8000/api/orders/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          plan_id: currentPlanId,
+          plan: currentPlan,
+          user_name: bookingData.user_name,
+          phone: bookingData.phone,
+          date: bookingData.date,
+        }),
+      });
+      const result = await response.json();
+
+      if (response.ok) {
+        setBookingResult({
+          success: true,
+          message: `验证完成：${result.total_orders ?? selectedBookable.length}个项目可预订`,
+          details: JSON.stringify(result, null, 2),
+        });
+      } else {
+        setBookingResult({
+          success: false,
+          message: result.detail || '验证失败',
+        });
+      }
+    } catch (error: any) {
+      console.error('验证订单失败:', error);
+      setBookingResult({
+        success: false,
+        message: '验证失败：网络或服务不可用',
+        details: error.message || '请稍后重试',
+      });
+    } finally {
+      setIsBookingLoading(false);
+    }
+  };
+
+  const executeSelectedOrders = async () => {
+    if (!validateBookingForm()) return;
+
+    const bookable = getBookableActivities();
+    const selectedBookable = bookable.filter(({ index }) => selectedItems[index]);
+
+    if (selectedBookable.length === 0) {
+      setBookingFormError('请选择要预订的项目');
+      return;
+    }
+
+    setIsBookingLoading(true);
+    setBookingFormError('');
+    setBookingResult(null);
+
+    // 逐个执行
+    const results = [];
+    for (const { index, activity } of selectedBookable) {
+      try {
+        const response = await fetch(`http://localhost:8000/api/orders/execute/${index}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            plan_id: currentPlanId,
+            plan: currentPlan,
+            user_name: bookingData.user_name,
+            phone: bookingData.phone,
+            date: bookingData.date,
+          }),
+        });
+        const result = await response.json();
+        results.push({ name: activity.name, result });
+        if (result.success) {
+          setOrderedItems(prev => ({ ...prev, [index]: true }));
+          setSelectedItems(prev => ({ ...prev, [index]: false }));
+        }
+      } catch (error: any) {
+        console.error(`下单失败: ${activity.name}`, error);
+        results.push({ name: activity.name, result: { success: false, message: error.message || '网络错误' } });
+      }
+    }
+
+    const successCount = results.filter(r => r.result.success).length;
+    setBookingResult({
+      success: successCount === results.length,
+      message: `下单完成: ${successCount}/${results.length} 成功`,
+      orders: results,
+    });
+    setIsBookingLoading(false);
+  };
+
+  // ============== 渲染 ==============
+
+  const getActivityIcon = (type: string) => {
+    switch (type.toLowerCase()) {
+      case 'attraction': return '🏛️';
+      case 'restaurant': return '🍽️';
+      case 'cafe': return '☕';
+      case 'shop': return '🛍️';
+      case 'activity': return '🎯';
+      case 'transport': return '🚕';
+      default: return '📌';
+    }
+  };
+
+  const getTransportIcon = (icon?: string, mode?: string) => {
+    if (icon) return icon;
+    switch (mode?.toLowerCase()) {
+      case 'taxi': return '🚕';
+      case 'subway': return '🚇';
+      case 'bus': return '🚌';
+      case 'walking': return '🚶';
+      case 'driving': return '🚗';
+      default: return '🚕';
+    }
+  };
+
+  // 计算非交通活动的索引
+  const getNonTransportActivityIndex = (planIndex: number): number => {
+    let count = 0;
+    for (let i = 0; i < planIndex; i++) {
+      if (currentPlan[i].activity_type !== 'transport') count++;
+    }
+    return count;
+  };
+
+  const bookableActivities = getBookableActivities();
+  const unorderedBookable = bookableActivities.filter(({ index }) => !orderedItems[index]);
+  const hasAlternatives = Object.keys(activityAlternatives).length > 0;
 
   return (
     <div className="flex h-screen bg-gray-100">
+      {/* 左侧：Agent 思考日志 */}
       <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
         <div className="p-4 border-b border-gray-200">
           <h2 className="text-lg font-semibold text-gray-800">Agent 思考过程</h2>
@@ -208,14 +605,27 @@ export default function ChatInterface() {
           {agentLogs.length === 0 ? (
             <div className="text-center text-gray-400 py-8">
               <p className="text-sm">等待Agent响应...</p>
-              <p className="text-xs mt-2 text-gray-300">提示：可以直接告诉小团你的偏好，比如"我有个5岁的孩子"</p>
+              <p className="text-xs mt-2 text-gray-300">提示：可以直接告诉小团你的偏好</p>
             </div>
           ) : (
             agentLogs.map(log => (
               <div key={log.id} className="flex items-start gap-2">
-                <span className="text-lg">{getLogIcon(log.type)}</span>
+                <span className="text-lg">
+                  {log.type === 'thinking' ? '🤔' :
+                   log.type === 'status' ? '📡' :
+                   log.type === 'skill_detected' ? '⚡' :
+                   log.type === 'plan_created' ? '📋' :
+                   log.type === 'plan_updated' ? '🔄' :
+                   log.type === 'preferences' ? '⚙️' : '❌'}
+                </span>
                 <div className="flex-1">
-                  <p className={`text-sm ${getLogColor(log.type)}`}>{log.content}</p>
+                  <p className={`text-sm ${
+                    log.type === 'error' ? 'text-red-600' :
+                    log.type === 'skill_detected' ? 'text-purple-600' :
+                    log.type === 'preferences' ? 'text-orange-600' :
+                    log.type === 'plan_created' || log.type === 'plan_updated' ? 'text-green-600' :
+                    'text-gray-600'
+                  }`}>{log.content}</p>
                   <p className="text-xs text-gray-400 mt-1">
                     {log.timestamp.toLocaleTimeString()}
                   </p>
@@ -233,6 +643,7 @@ export default function ChatInterface() {
         </div>
       </div>
 
+      {/* 中间：对话区域 */}
       <div className="flex-1 flex flex-col">
         <header className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm">
           <div className="flex items-center justify-between">
@@ -256,9 +667,28 @@ export default function ChatInterface() {
           </div>
         </header>
 
+        {lastError && (
+          <div className="bg-red-50 border-b border-red-200 px-6 py-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-red-600 font-medium">{lastError.code}</span>
+                <p className="text-red-500 text-sm mt-1">{lastError.message}</p>
+              </div>
+              {lastError.retry && (
+                <button
+                  onClick={sendRetry}
+                  className="px-4 py-2 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600 transition-colors"
+                >
+                  重试
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto p-6">
           <div className="max-w-3xl mx-auto space-y-4">
-            {messages.length === 0 ? (
+            {messages.length === 0 && !isProcessing && !isStreaming && !lastError ? (
               <div className="text-center py-16">
                 <div className="w-20 h-20 bg-meituan-yellow rounded-full flex items-center justify-center mx-auto mb-6">
                   <span className="text-4xl">👋</span>
@@ -282,52 +712,495 @@ export default function ChatInterface() {
                 <p className="text-xs text-gray-400 mt-6">也可以告诉我您的偏好，比如："我有个5岁的孩子，老婆在减肥"</p>
               </div>
             ) : (
-              messages.map(msg => (
-                <div
-                  key={msg.id}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                >
+              <>
+                {messages.map(msg => (
                   <div
-                    className={`max-w-[80%] px-4 py-3 rounded-2xl ${
-                      msg.role === 'user'
-                        ? 'bg-meituan-yellow text-gray-800'
-                        : 'bg-white text-gray-800 border border-gray-200'
-                    }`}
+                    key={msg.id}
+                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
                   >
-                    <div className="whitespace-pre-wrap">{msg.content}</div>
-                    <div className={`text-xs mt-2 ${
-                      msg.role === 'user' ? 'text-gray-600' : 'text-gray-400'
-                    }`}>
-                      {msg.timestamp.toLocaleTimeString()}
+                    <div
+                      className={`max-w-[80%] px-4 py-3 rounded-2xl ${
+                        msg.role === 'user'
+                          ? 'bg-meituan-yellow text-gray-800'
+                          : 'bg-white text-gray-800 border border-gray-200'
+                      }`}
+                    >
+                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                      <div className={`text-xs mt-2 ${
+                        msg.role === 'user' ? 'text-gray-600' : 'text-gray-400'
+                      }`}>
+                        {msg.timestamp.toLocaleTimeString()}
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))
+                ))}
+                {isStreaming && (
+                  <div className="flex justify-start">
+                    <div className="max-w-[80%] px-4 py-3 rounded-2xl bg-white text-gray-800 border border-gray-200">
+                      <div className="whitespace-pre-wrap">{streamingContent}<span className="animate-pulse">|</span></div>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
             <div ref={messagesEndRef} />
           </div>
         </div>
 
         <footer className="bg-white border-t border-gray-200 p-4">
-          <form onSubmit={sendMessage} className="max-w-3xl mx-auto flex gap-3">
+          <form onSubmit={(e) => sendMessage(e, isProcessing ? 'interrupt' : 'message')} className="max-w-3xl mx-auto flex gap-3">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={isProcessing ? "Agent正在处理中..." : "输入您的需求，随时可以补充信息..."}
-              disabled={isProcessing}
+              placeholder={isProcessing ? "按回车追加信息..." : "输入您的需求..."}
+              disabled={!isConnected}
               className="flex-1 px-4 py-3 bg-gray-100 rounded-xl border-2 border-transparent focus:border-meituan-yellow focus:bg-white focus:outline-none transition-all disabled:opacity-50"
             />
             <button
               type="submit"
-              disabled={!input.trim() || isProcessing}
+              disabled={!input.trim() || !isConnected}
               className="px-6 py-3 bg-meituan-yellow text-gray-800 rounded-xl hover:opacity-90 transition-opacity font-medium disabled:opacity-50"
             >
-              发送
+              {isProcessing ? '追加' : '发送'}
             </button>
           </form>
+          {isProcessing && (
+            <p className="max-w-3xl mx-auto text-xs text-gray-400 mt-2 text-center">
+              💡 输入后按回车可以追加信息，不打断当前思考
+            </p>
+          )}
         </footer>
       </div>
+
+      {/* 右侧：方案面板 */}
+      {showPlanPanel && currentPlan.length > 0 && (
+        <div className="w-[420px] bg-white border-l border-gray-200 flex flex-col">
+          <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-gray-800">📋 活动方案</h2>
+            <button
+              onClick={() => setShowPlanPanel(false)}
+              className="text-gray-400 hover:text-gray-600"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* 方案工具条 */}
+          <div className="px-4 py-3 border-b border-gray-100 bg-gray-50 flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-gray-500">
+              ID: <span className="font-mono text-gray-700">{currentPlanId}</span>
+            </span>
+            {!hasAlternatives ? (
+              <button
+                onClick={loadAlternatives}
+                disabled={isLoadingAlternatives}
+                className="ml-auto px-3 py-1.5 bg-blue-500 text-white text-xs rounded-lg hover:bg-blue-600 transition-colors disabled:opacity-50"
+              >
+                {isLoadingAlternatives ? '加载中...' : '🔄 查看替代方案'}
+              </button>
+            ) : (
+              <span className="ml-auto text-xs text-green-600">✓ 已加载替代方案</span>
+            )}
+          </div>
+
+          {/* 活动列表 */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {currentPlan.map((activity, planIndex) => {
+              const isTransport = activity.activity_type === 'transport';
+              const nonTransportIdx = getNonTransportActivityIndex(planIndex);
+              const alternatives = activityAlternatives[nonTransportIdx];
+              const hasAlts = alternatives && alternatives.length > 1;
+              const selectedAltIdx = getSelectedAlternativeIndex(nonTransportIdx);
+              const isBookable = activity.pre_book?.need && !isTransport;
+              const isOrdered = orderedItems[planIndex];
+
+              return (
+                <div
+                  key={planIndex}
+                  className={`rounded-xl p-4 border relative ${
+                    isTransport
+                      ? 'bg-blue-50 border-blue-200'
+                      : 'bg-white border-gray-200'
+                  }`}
+                >
+                  {/* 选中复选框（仅可预订且未下单的显示） */}
+                  {isBookable && !isOrdered && (
+                    <div className="absolute top-3 right-3 z-10">
+                      <input
+                        type="checkbox"
+                        checked={!!selectedItems[planIndex]}
+                        onChange={() => toggleSelectItem(planIndex)}
+                        className="w-4 h-4 cursor-pointer"
+                      />
+                    </div>
+                  )}
+
+                  {/* 已下单标记 */}
+                  {isOrdered && (
+                    <div className="absolute top-3 right-3 z-10 px-2 py-0.5 bg-green-500 text-white text-xs rounded-full">
+                      ✓ 已预订
+                    </div>
+                  )}
+
+                  <div className="flex items-start gap-3">
+                    <span className="text-2xl">
+                      {isTransport
+                        ? getTransportIcon(activity.mode_icon, activity.mode)
+                        : getActivityIcon(activity.activity_type)}
+                    </span>
+                    <div className="flex-1 pr-8">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded-full">
+                          {activity.order}
+                        </span>
+                        <h3 className="font-medium text-gray-800">{activity.name}</h3>
+                      </div>
+                      <div className="flex items-center gap-2 mt-2 text-sm">
+                        <span className="text-gray-500">⏰</span>
+                        <span className="text-gray-600">
+                          {activity.time_slot?.start} - {activity.time_slot?.end}
+                        </span>
+                      </div>
+
+                      {/* 交通活动信息 */}
+                      {isTransport ? (
+                        <div className="mt-2 space-y-1">
+                          {activity.from_location?.name && (
+                            <p className="text-xs text-gray-500">
+                              📍 从: {activity.from_location.name}
+                            </p>
+                          )}
+                          {activity.to_location?.name && (
+                            <p className="text-xs text-gray-500">
+                              📍 到: {activity.to_location.name}
+                            </p>
+                          )}
+                          <div className="flex items-center gap-4 mt-1 text-xs text-gray-400">
+                            {activity.duration_minutes && (
+                              <span>⏱️ {activity.duration_minutes}分钟</span>
+                            )}
+                            {activity.distance_m && (
+                              <span>📍 {(activity.distance_m / 1000).toFixed(1)}公里</span>
+                            )}
+                          </div>
+                          {activity.details?.description && (
+                            <p className="text-xs text-gray-500 mt-1 italic">
+                              {activity.details.description}
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <>
+                          {/* 普通活动信息 */}
+                          {activity.location?.address && (
+                            <p className="text-sm text-gray-500 mt-1">📍 {activity.location.address}</p>
+                          )}
+                          {(activity.duration_hours || activity.duration_minutes) && (
+                            <div className="flex items-center gap-4 mt-2 text-xs text-gray-400">
+                              {activity.duration_hours && (
+                                <span>⏱️ {activity.duration_hours}小时</span>
+                              )}
+                              {activity.duration_minutes && (
+                                <span>⏱️ {activity.duration_minutes}分钟</span>
+                              )}
+                            </div>
+                          )}
+                          {activity.details && (
+                            <div className="flex items-center gap-4 mt-2 text-xs">
+                              {activity.details.rating && (
+                                <span className="text-yellow-500">⭐ {activity.details.rating}</span>
+                              )}
+                              {activity.details.price != null && activity.details.price > 0 && (
+                                <span className="text-meituan-yellow">💰 ¥{activity.details.price}</span>
+                              )}
+                            </div>
+                          )}
+                          {activity.details?.tags && activity.details.tags.length > 0 && (
+                            <div className="flex flex-wrap gap-1 mt-2">
+                              {activity.details.tags.map((tag, i) => (
+                                <span
+                                  key={i}
+                                  className="text-xs px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full"
+                                >
+                                  {tag}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {isBookable && (
+                            <div className="mt-2 p-2 bg-orange-50 rounded-lg">
+                              <p className="text-xs text-orange-600">
+                                🎫 需要预订: {activity.pre_book?.item}
+                              </p>
+                            </div>
+                          )}
+                          {activity.notes && (
+                            <p className="text-xs text-gray-500 mt-2 italic">📝 {activity.notes}</p>
+                          )}
+
+                          {/* 替代方案轮播 */}
+                          {hasAlts && (
+                            <div className="mt-3 p-3 bg-gray-50 rounded-lg border border-gray-200">
+                              <div className="flex items-center justify-between mb-2">
+                                <span className="text-xs text-gray-500">💡 替代方案</span>
+                                <span className="text-xs text-gray-400">
+                                  {selectedAltIdx + 1} / {alternatives.length}
+                                </span>
+                              </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <button
+                                  onClick={() => {
+                                    const prevIdx = (selectedAltIdx - 1 + alternatives.length) % alternatives.length;
+                                    selectAlternative(nonTransportIdx, alternatives[prevIdx].id);
+                                  }}
+                                  className="px-2 py-1 bg-white border border-gray-300 rounded text-sm hover:bg-gray-100 transition-colors disabled:opacity-50"
+                                >
+                                  ←
+                                </button>
+                                <div className="flex-1 text-center">
+                                  <div className="text-sm font-medium text-gray-800 truncate">
+                                    {alternatives[selectedAltIdx]?.activity?.name}
+                                  </div>
+                                  {alternatives[selectedAltIdx]?.activity?.details?.price != null &&
+                                   alternatives[selectedAltIdx]?.activity?.details?.price > 0 && (
+                                    <div className="text-xs text-meituan-yellow mt-1">
+                                      ¥{alternatives[selectedAltIdx].activity.details?.price}
+                                    </div>
+                                  )}
+                                  {alternatives[selectedAltIdx]?.llm_score != null && (
+                                    <div className="text-xs text-gray-400">
+                                      评分: {alternatives[selectedAltIdx].llm_score}
+                                    </div>
+                                  )}
+                                </div>
+                                <button
+                                  onClick={() => {
+                                    const nextIdx = (selectedAltIdx + 1) % alternatives.length;
+                                    selectAlternative(nonTransportIdx, alternatives[nextIdx].id);
+                                  }}
+                                  className="px-2 py-1 bg-white border border-gray-300 rounded text-sm hover:bg-gray-100 transition-colors disabled:opacity-50"
+                                >
+                                  →
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 底部操作区域 */}
+          <div className="p-4 border-t border-gray-200 space-y-2">
+            {/* 左下角预订按钮 */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowBookingForm(true)}
+                className="px-4 py-2.5 bg-gray-600 text-white text-sm rounded-xl hover:bg-gray-700 transition-colors flex items-center gap-2"
+              >
+                📝 填写预订信息
+              </button>
+              {bookableActivities.length > 0 && (
+                <button
+                  onClick={selectAllUnordered}
+                  className="px-3 py-2.5 bg-white border border-gray-300 text-gray-700 text-sm rounded-xl hover:bg-gray-50 transition-colors"
+                >
+                  全选({unorderedBookable.length})
+                </button>
+              )}
+            </div>
+
+            {/* 一键下单按钮 */}
+            {unorderedBookable.length > 0 ? (
+              <button
+                onClick={executeSelectedOrders}
+                disabled={Object.keys(selectedItems).filter(k => selectedItems[k]).length === 0}
+                className="w-full py-3 bg-meituan-yellow text-gray-800 rounded-xl font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+              >
+                🎫 一键下单 ({Object.keys(selectedItems).filter(k => selectedItems[k]).length}/{unorderedBookable.length}项)
+              </button>
+            ) : bookableActivities.length > 0 ? (
+              <div className="w-full py-3 bg-green-100 text-green-700 rounded-xl font-medium text-center">
+                ✓ 所有项目已预订
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {/* 预订信息表单弹窗 */}
+      {showBookingForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-2xl max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-800">📝 预订信息</h3>
+              <button
+                onClick={() => { setShowBookingForm(false); setBookingFormError(''); setBookingFieldErrors({}); setBookingResult(null); }}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4 overflow-y-auto">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  姓名 <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={bookingData.user_name}
+                  onChange={(e) => {
+                    setBookingData(prev => ({ ...prev, user_name: e.target.value }));
+                    if (bookingFieldErrors.user_name) setBookingFieldErrors(prev => ({ ...prev, user_name: '' }));
+                  }}
+                  placeholder="请输入预订人姓名"
+                  className={`w-full px-3 py-2 border rounded-lg focus:border-meituan-yellow focus:outline-none ${
+                    bookingFieldErrors.user_name ? 'border-red-400 bg-red-50' : 'border-gray-300'
+                  }`}
+                />
+                {bookingFieldErrors.user_name && (
+                  <p className="mt-1 text-xs text-red-500">{bookingFieldErrors.user_name}</p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  手机号 <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="tel"
+                  value={bookingData.phone}
+                  onChange={(e) => {
+                    setBookingData(prev => ({ ...prev, phone: e.target.value }));
+                    if (bookingFieldErrors.phone) setBookingFieldErrors(prev => ({ ...prev, phone: '' }));
+                  }}
+                  placeholder="请输入手机号"
+                  className={`w-full px-3 py-2 border rounded-lg focus:border-meituan-yellow focus:outline-none ${
+                    bookingFieldErrors.phone ? 'border-red-400 bg-red-50' : 'border-gray-300'
+                  }`}
+                />
+                {bookingFieldErrors.phone && (
+                  <p className="mt-1 text-xs text-red-500">{bookingFieldErrors.phone}</p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  日期 <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="date"
+                  value={bookingData.date}
+                  onChange={(e) => {
+                    setBookingData(prev => ({ ...prev, date: e.target.value }));
+                    if (bookingFieldErrors.date) setBookingFieldErrors(prev => ({ ...prev, date: '' }));
+                  }}
+                  className={`w-full px-3 py-2 border rounded-lg focus:border-meituan-yellow focus:outline-none ${
+                    bookingFieldErrors.date ? 'border-red-400 bg-red-50' : 'border-gray-300'
+                  }`}
+                />
+                {bookingFieldErrors.date && (
+                  <p className="mt-1 text-xs text-red-500">{bookingFieldErrors.date}</p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  人数 <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="number"
+                  value={bookingData.people}
+                  onChange={(e) => {
+                    setBookingData(prev => ({ ...prev, people: parseInt(e.target.value) || 2 }));
+                    if (bookingFieldErrors.people) setBookingFieldErrors(prev => ({ ...prev, people: '' }));
+                  }}
+                  min="1"
+                  max="20"
+                  className={`w-full px-3 py-2 border rounded-lg focus:border-meituan-yellow focus:outline-none ${
+                    bookingFieldErrors.people ? 'border-red-400 bg-red-50' : 'border-gray-300'
+                  }`}
+                />
+                {bookingFieldErrors.people && (
+                  <p className="mt-1 text-xs text-red-500">{bookingFieldErrors.people}</p>
+                )}
+              </div>
+            </div>
+
+            {bookingFormError && (
+              <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg">
+                <p className="text-sm text-red-600">{bookingFormError}</p>
+              </div>
+            )}
+
+            {bookingResult && (
+              <div className={`mt-4 p-4 rounded-lg ${
+                bookingResult.success ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'
+              }`}>
+                <p className={`text-sm font-medium ${bookingResult.success ? 'text-green-700' : 'text-red-700'}`}>
+                  {bookingResult.success ? '✓ ' : '✗ '}{bookingResult.message}
+                </p>
+                {bookingResult.orders && bookingResult.orders.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {bookingResult.orders.map((order: any, idx: number) => (
+                      <p key={idx} className={`text-xs ${order.result.success ? 'text-green-600' : 'text-red-600'}`}>
+                      {order.name}: {order.result.success ? '成功' : '失败'}
+                      {order.result.order_id && ` (${order.result.order_id})`}
+                      {order.result.message && ` - ${order.result.message}`}
+                    </p>
+                    ))}
+                  </div>
+                )}
+                {bookingResult.details && (
+                  <details className="mt-2">
+                    <summary className="text-xs text-gray-600 cursor-pointer hover:text-gray-800">查看详情</summary>
+                    <pre className="mt-2 p-2 bg-white rounded text-xs text-gray-700 max-h-40 overflow-auto">
+                      {bookingResult.details}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            )}
+
+            <div className="mt-6 flex gap-3">
+              <button
+                onClick={() => { setShowBookingForm(false); setBookingFormError(''); setBookingFieldErrors({}); setBookingResult(null); }}
+                disabled={isBookingLoading}
+                className="flex-1 py-2.5 border border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                onClick={validateOrders}
+                disabled={isBookingLoading}
+                className="flex-1 py-2.5 bg-blue-500 text-white rounded-xl hover:bg-blue-600 transition-colors disabled:opacity-50"
+              >
+                {isBookingLoading ? '处理中...' : '验证订单'}
+              </button>
+              <button
+                onClick={executeSelectedOrders}
+                disabled={isBookingLoading}
+                className="flex-1 py-2.5 bg-meituan-yellow text-gray-800 rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50"
+              >
+                {isBookingLoading ? '处理中...' : '一键下单'}
+              </button>
+            </div>
+
+            {isBookingLoading && (
+              <div className="mt-3 text-center">
+                <div className="inline-block animate-spin w-4 h-4 border-2 border-meituan-yellow border-t-transparent rounded-full mr-2"></div>
+                <span className="text-xs text-gray-500">正在处理，请稍候...</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

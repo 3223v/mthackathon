@@ -1,0 +1,34 @@
+[
+  {
+    "id": "SH001",
+    "name": "7-11便利店（朝阳大悦城店）",
+    "type": "convenience_store",
+    "location": {"lng": 116.521, "lat": 39.928},
+    "address": "B1层",
+    "rating": 4.5,
+    "price_level": "低",
+    "opening_hours": "24小时",
+    "tags": ["零食", "饮料"],
+    "suitable_for": ["family", "friends"],
+    "availability": null
+  },
+  {
+    "id": "SH002",
+    "name": "朝阳大悦城",
+    "type": "shopping_mall",
+    "location": {"lng": 116.521, "lat": 39.928},
+    "address": "朝阳北路101号",
+    "rating": 4.8,
+    "price_level": "中",
+    "opening_hours": "10:00-22:00",
+    "tags": ["购物", "儿童乐园"],
+    "suitable_for": ["family", "friends"],
+    "facilities": ["母婴室", "儿童推车", "停车场"],
+    "availability": {
+      "2025-06-03": {
+        "儿童乐园": {"available_slots": 10, "price": 50},
+        "电影院": {"available_seats": 30}
+      }
+    }
+  }
+]

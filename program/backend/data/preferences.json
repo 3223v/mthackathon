@@ -1,19 +1,47 @@
 {
+  "user_id": "default_user",
+  "personal_info": {
+    "name": "test",
+    "age": null,
+    "gender": "",
+    "home_location": {
+      "lat": null,
+      "lng": null,
+      "address": ""
+    },
+    "work_location": {
+      "lat": null,
+      "lng": null,
+      "address": ""
+    },
+    "phone": ""
+  },
   "preferences": {
-    "user_id": "default_user",
-    "preferences": "天下午是空的，想和老婆孩子/朋友出去玩几个小时，别离家太远，帮我安排一下",
-    "family_info": {
-      "has_children": true,
-      "children_ages": [
-        5
-      ],
-      "spouse_diet": "减肥中"
+    "diet": [
+      "辣味",
+      "火锅"
+    ],
+    "transport": [],
+    "activity_types": [],
+    "budget_range": "",
+    "travel_style": "",
+    "other": ""
+  },
+  "social_relationships": [
+    {
+      "relation": "child",
+      "preferences": {}
     },
-    "friends_info": {
-      "total_count": 4,
-      "male_count": 2,
-      "female_count": 2
-    },
-    "update_time": "2026-05-27T22:27:45.385206"
-  }
+    {
+      "relation": "spouse",
+      "preferences": {}
+    }
+  ],
+  "friends_group": {
+    "typical_size": 4,
+    "common_activities": [],
+    "members": []
+  },
+  "created_at": "",
+  "updated_at": "2026-06-03T21:28:32.562784"
 }

@@ -1,40 +1,54 @@
-"""LangGraph Agent系统 - 简化版
+"""
+Agent 图定义 — LangGraph 工作流 v2
 
-只保存聊天历史和用户偏好信息。
-执行操作需要用户确认。
+新增能力：
+- 真实 LLM token 级流式输出
+- 增强日志：记录每个节点的输入/输出和数据流转
+- WebSocket 回调注入（通过 config.configurable）
+
+节点流程：
+analyze_intent → [general_response | extract_preferences | query_data | replan_*]
+extract_preferences → [query_data | END]
+query_data → planner → END
+replace_activity → END
+partial_replan → END
+full_replan → query_data → planner → END
 """
 
 import json
 import os
-import random
-import time
-from typing import Literal
+import asyncio
+from typing import Literal, Optional, Callable, Awaitable, Any
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain.tools import tool
-from langgraph.prebuilt import ToolExecutor
-from .state import AgentState
-from tools import QueryTools, ExecuteTools
-from utils import logger, agent_logger
-import asyncio
+from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_openai import ChatOpenAI
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/prompts.json")
+from agent.state import AgentState
+from agent.nodes import (
+    analyze_intent,
+    general_response,
+    extract_preferences,
+    query_data,
+    generate_plan,
+    replace_activity,
+    partial_replan,
+    full_replan,
+)
+from core.skill_loader import skill_loader
+from utils import logger, agent_logger
+
+# ==================== 配置路径 ====================
 LLM_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/llm_config.json")
 
-logger.info("加载配置文件...")
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    prompts = json.load(f)
+# 流式回调类型
+StreamCallback = Optional[Callable[[str], Awaitable[None]]]
 
-with open(LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
-    llm_config_list = json.load(f)
 
-logger.info("初始化工具...")
-query_tools = QueryTools()
-execute_tools = ExecuteTools()
-
+# ==================== LLM 管理器（支持流式） ====================
 class LLMManager:
-    """LLM管理器 - 实现多LLM配置轮询策略和自动重试"""
+    """LLM管理器 — 多LLM轮询 + 自动重试 + token级流式输出"""
 
     def __init__(self, configs: list):
         self.configs = configs
@@ -45,374 +59,327 @@ class LLMManager:
         self._init_llms()
 
     def _init_llms(self):
-        """初始化所有LLM实例"""
-        from langchain_openai import ChatOpenAI
-        
         for i, config in enumerate(self.configs):
             api_key = config.get("api_key")
-            
             if not api_key or api_key.strip() == "":
-                logger.warning(f"LLM配置 #{i+1} ({config.get('name', 'unknown')}) API密钥未配置，跳过")
+                logger.warning(f"LLM #{i+1} ({config.get('name', '?')}) API密钥未配置，跳过")
                 continue
-            
             try:
                 llm = ChatOpenAI(
                     model=config.get("model", "gpt-4o"),
                     base_url=config.get("base_url"),
                     api_key=api_key,
                     temperature=config.get("temperature", 0.7),
-                    max_tokens=config.get("max_tokens", 2048),
+                    max_tokens=config.get("max_tokens", 4096),
                     streaming=True,
-                    max_retries=0
+                    max_retries=0,
                 )
-                self.llms.append({
-                    "llm": llm,
-                    "config": config
-                })
+                self.llms.append({"llm": llm, "config": config})
                 logger.info(f"LLM #{i+1} 初始化成功 | name={config.get('name')} | model={config.get('model')}")
             except Exception as e:
                 logger.error(f"LLM #{i+1} 初始化失败 | error={str(e)}")
 
         if not self.llms:
-            logger.error("没有可用的LLM配置！请检查llm_config.json文件")
+            logger.error("没有可用的LLM配置！")
 
     def _get_next_llm(self):
-        """获取下一个LLM（轮询策略）"""
         if not self.llms:
             return None, None
-        
         llm_info = self.llms[self.current_index]
         self.current_index = (self.current_index + 1) % len(self.llms)
         return llm_info["llm"], llm_info["config"]
 
-    async def invoke(self, messages: list):
-        """调用LLM，带自动重试和轮询"""
+    async def invoke(self, messages: list, stream_callback: StreamCallback = None) -> str:
+        """
+        调用LLM，支持流式输出
+
+        Args:
+            messages: 消息列表
+            stream_callback: 流式回调 async fn(token: str) -> None
+
+        Returns:
+            完整的响应文本
+        """
         if not self.llms:
-            raise ValueError("没有可用的LLM配置！请在llm_config.json中配置API密钥")
+            raise ValueError("没有可用的LLM配置！")
 
         last_error = None
-        
+
         for attempt in range(self.retry_count):
             llm, config = self._get_next_llm()
-            
             if llm is None:
                 raise ValueError("没有可用的LLM配置")
-            
+
             try:
-                logger.info(f"调用LLM [{config.get('name')}] | attempt={attempt+1}")
-                response = await llm.ainvoke(messages)
-                logger.info(f"LLM [{config.get('name')}] 调用成功")
-                return response
-            
+                llm_name = config.get("name", "?")
+                logger.info(f"LLM调用 [{llm_name}] | attempt={attempt+1} | streaming={stream_callback is not None}")
+                agent_logger.llm_invoking("stream")
+
+                if stream_callback:
+                    # 流式模式：逐 token 输出
+                    full_text = ""
+                    async for chunk in llm.astream(messages):
+                        if chunk.content:
+                            full_text += chunk.content
+                            await stream_callback(chunk.content)
+                    logger.info(f"LLM [{llm_name}] 流式完成 | length={len(full_text)}")
+                    return full_text
+                else:
+                    # 非流式模式
+                    response = await llm.ainvoke(messages)
+                    content = response.content if hasattr(response, 'content') else str(response)
+                    logger.info(f"LLM [{llm_name}] 调用成功 | length={len(content)}")
+                    return content
+
             except Exception as e:
-                error_msg = f"LLM [{config.get('name')}] 调用失败 | error={str(e)}"
-                logger.error(error_msg)
+                logger.error(f"LLM [{config.get('name', '?')}] 失败 | error={str(e)}")
                 last_error = e
-                
                 if attempt < self.retry_count - 1:
-                    logger.info(f"等待 {self.retry_delay} 秒后重试...")
+                    logger.info(f"等待 {self.retry_delay}s 后重试...")
                     await asyncio.sleep(self.retry_delay)
                     self.retry_delay *= 1.5
 
-        raise Exception(f"所有LLM调用均失败，最后错误: {str(last_error)}")
+        raise Exception(f"所有LLM调用均失败: {str(last_error)}")
+
+    async def invoke_with_logging(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        stream_callback: StreamCallback = None,
+        log_prefix: str = "",
+    ) -> str:
+        """
+        带日志的 LLM 调用，记录完整的 system/user prompt 和响应
+        """
+        logger.info(f"{'='*40}")
+        logger.info(f"{log_prefix} | LLM调用开始")
+        logger.info(f"System prompt length: {len(system_prompt)} chars")
+        logger.info(f"User prompt length: {len(user_prompt)} chars")
+        logger.debug(f"System prompt preview: {system_prompt[:500]}...")
+        logger.debug(f"User prompt preview: {user_prompt[:500]}...")
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+
+        result = await self.invoke(messages, stream_callback=stream_callback)
+
+        logger.info(f"{log_prefix} | LLM响应 length={len(result)}")
+        logger.debug(f"Response preview: {result[:500]}...")
+        logger.info(f"{'='*40}")
+
+        return result
 
     def has_llms(self):
-        """检查是否有可用的LLM"""
         return len(self.llms) > 0
 
-logger.info("初始化LLM管理器...")
+
+# ==================== 初始化 ====================
+logger.info("=" * 60)
+logger.info("Agent 系统 v2 初始化中...")
+logger.info("=" * 60)
+
+logger.info("加载 LLM 配置...")
+with open(LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+    llm_config_list = json.load(f)
+
+logger.info("初始化 LLM 管理器...")
 llm_manager = LLMManager(llm_config_list)
 
 if not llm_manager.has_llms():
-    logger.error("警告：没有可用的LLM配置！请在llm_config.json中正确配置API密钥")
+    logger.error("警告：没有可用的LLM配置！")
 
-INTENT_TYPE = Literal["preferences", "activity_plan", "booking", "general"]
+logger.info("加载 Skills...")
+skills = skill_loader.load_all()
+logger.info(f"Skills 加载完成: {len(skills)} 个 ({[s['id'] for s in skills]})")
 
-def analyze_intent(state: AgentState) -> AgentState:
-    """分析用户意图"""
-    messages = state["messages"]
-    last_message = messages[-1] if messages else None
 
-    conversation_id = state.get("conversation_id", "unknown")
+# ==================== 节点包装（带流式回调 + 增强日志） ====================
 
-    if not isinstance(last_message, HumanMessage):
-        return state
+def _get_stream_callback(config: RunnableConfig) -> StreamCallback:
+    """从 config 中提取 WebSocket 流式回调"""
+    if config and "configurable" in config:
+        return config["configurable"].get("stream_callback")
+    return None
 
-    user_input = last_message.content
-    agent_logger.intent_analyzing(conversation_id, user_input)
 
-    intent_type: INTENT_TYPE = "general"
-    current_skill = None
+async def node_analyze_intent(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    logger.info(f"[节点: analyze_intent] 输入: messages_count={len(state.get('messages', []))}")
+    result = analyze_intent(state)
+    logger.info(f"[节点: analyze_intent] 输出: intent={result.get('intent_type')} | skill={result.get('skill_context', {}).get('id', 'None') if result.get('skill_context') else 'None'}")
+    return result
 
-    preference_keywords = ["喜欢", "偏好", "爱好", "我的情况", "我家", "孩子", "老婆", "老公", "家庭"]
-    plan_keywords = ["出去玩", "安排", "规划", "推荐", "去哪", "吃什么", "约会", "聚会"]
-    booking_keywords = ["预订", "订", "下单", "购票", "预约"]
 
-    if any(keyword in user_input.lower() for keyword in preference_keywords):
-        intent_type = "preferences"
-        logger.info(f"检测到偏好设置意图 | conversation_id={conversation_id}")
-        
-        family_info = {}
-        friends_info = {}
-        
-        if "孩子" in user_input:
-            family_info["has_children"] = True
-            import re
-            ages = re.findall(r'(\d+)岁', user_input)
-            if ages:
-                family_info["children_ages"] = [int(a) for a in ages]
-        
-        if "老婆" in user_input or "减肥" in user_input:
-            family_info["spouse_diet"] = "减肥中" if "减肥" in user_input else ""
-        
-        if "朋友" in user_input:
-            counts = re.findall(r'(\d+)个', user_input)
-            if counts:
-                friends_info["total_count"] = int(counts[0])
-        
-        if family_info or friends_info:
-            state["context"]["family_info"] = family_info
-            state["context"]["friends_info"] = friends_info
+async def node_general_response(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    logger.info(f"[节点: general_response] 输入: intent={state.get('intent_type')}")
+    result = general_response(state)
+    logger.info(f"[节点: general_response] 输出: response_length={len(result.get('messages', [{}])[0].content) if result.get('messages') else 0}")
+    return result
 
-    elif any(keyword in user_input.lower() for keyword in plan_keywords):
-        intent_type = "activity_plan"
-        
-        if any(keyword in user_input.lower() for keyword in ["孩子", "亲子", "带娃", "家庭"]):
-            current_skill = "Parent-ChildTravelPlanning"
-        elif any(keyword in user_input.lower() for keyword in ["朋友", "聚会", "多人"]):
-            current_skill = "FriendsOuting"
-        elif any(keyword in user_input.lower() for keyword in ["约会", "对象", "浪漫"]):
-            current_skill = "PersonalTravelPlanning"
-        
-        logger.info(f"检测到活动规划意图 | conversation_id={conversation_id} | skill={current_skill}")
 
-    elif any(keyword in user_input.lower() for keyword in booking_keywords):
-        intent_type = "booking"
-        logger.info(f"检测到预订意图 | conversation_id={conversation_id}")
+async def node_extract_preferences(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    logger.info(f"[节点: extract_preferences] 输入: has_profile={bool(state.get('user_profile'))}")
+    result = extract_preferences(state)
+    profile = result.get("user_profile", {})
+    logger.info(f"[节点: extract_preferences] 输出: diet={profile.get('diet_preferences')} | budget={profile.get('budget_range')} | relationships={len(profile.get('social_relationships', []))}")
+    return result
 
-    agent_logger.intent_analyzed(conversation_id, current_skill)
 
-    return {
-        **state,
-        "intent_type": intent_type,
-        "current_skill": current_skill,
-        "context": state.get("context", {})
+async def node_query_data(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    logger.info(f"[节点: query_data] 输入: skill={state.get('skill_context', {}).get('id', 'None') if state.get('skill_context') else 'None'} | filters_ready={bool(state.get('skill_context'))}")
+    result = query_data(state)
+    qr = result.get("query_results", {})
+    total = sum(len(v) for v in qr.values())
+    logger.info(f"[节点: query_data] 输出: total_items={total} | attractions={len(qr.get('attractions', []))} | restaurants={len(qr.get('restaurants', []))} | activities={len(qr.get('activities', []))}")
+    return result
+
+
+async def node_planner(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    """规划生成 — 流式输出到前端"""
+    logger.info(f"[节点: planner] 输入: plan_empty={not state.get('plan')} | query_items={sum(len(v) for v in state.get('query_results', {}).values())}")
+
+    if not llm_manager.has_llms():
+        return {"messages": [AIMessage(content="抱歉，当前没有可用的 LLM 服务。")]}
+
+    stream_cb = _get_stream_callback(config)
+    result = await generate_plan(state, llm_manager, stream_callback=stream_cb)
+
+    plan = result.get("plan", [])
+    logger.info(f"[节点: planner] 输出: plan_length={len(plan)} | plan_id={result.get('plan_id')} | activities={[a.get('name', '?') for a in plan]}")
+    if plan:
+        logger.debug(f"[节点: planner] Plan JSON:\n{json.dumps(plan, ensure_ascii=False, indent=2)}")
+    return result
+
+
+async def node_replace_activity(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    """替换单活动"""
+    target = state.get("replan_target", {})
+    plan = state.get("plan", [])
+    logger.info(f"[节点: replace_activity] 输入: plan_length={len(plan)} | target={target.get('target_description', '?')[:50]}")
+
+    if not llm_manager.has_llms():
+        return {"messages": [AIMessage(content="抱歉，当前没有可用的 LLM 服务。")]}
+
+    stream_cb = _get_stream_callback(config)
+    result = await replace_activity(state, llm_manager, stream_callback=stream_cb)
+
+    new_plan = result.get("plan", [])
+    logger.info(f"[节点: replace_activity] 输出: new_plan_length={len(new_plan)}")
+    return result
+
+
+async def node_partial_replan(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    """部分重规划"""
+    target = state.get("replan_target", {})
+    logger.info(f"[节点: partial_replan] 输入: plan_length={len(state.get('plan', []))} | start_after_index={target.get('start_after_index')}")
+
+    if not llm_manager.has_llms():
+        return {"messages": [AIMessage(content="抱歉，当前没有可用的 LLM 服务。")]}
+
+    stream_cb = _get_stream_callback(config)
+    result = await partial_replan(state, llm_manager, stream_callback=stream_cb)
+
+    new_plan = result.get("plan", [])
+    logger.info(f"[节点: partial_replan] 输出: new_plan_length={len(new_plan)}")
+    return result
+
+
+async def node_full_replan(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
+    """全量重规划"""
+    logger.info(f"[节点: full_replan] 输入: old_plan_length={len(state.get('plan', []))}")
+    result = await full_replan(state, llm_manager)
+    logger.info(f"[节点: full_replan] 输出: intent={result.get('intent_type')} | plan_cleared={not result.get('plan')}")
+    return result
+
+
+# ==================== 路由函数 ====================
+
+def route_after_intent(state: AgentState) -> Literal[
+    "general_response", "extract_preferences", "query_data",
+    "replace_activity", "partial_replan", "full_replan",
+]:
+    intent_type = state.get("intent_type", "general")
+    routes = {
+        "general": "general_response",
+        "preferences": "extract_preferences",
+        "planning": "extract_preferences",
+        "replan_full": "query_data",
+        "replan_replace": "replace_activity",
+        "replan_partial": "partial_replan",
     }
+    target = routes.get(intent_type, "general_response")
+    logger.info(f"[路由] analyze_intent → {target} (intent={intent_type})")
+    return target
 
-async def handle_preferences(state: AgentState):
-    """处理偏好设置"""
-    messages = state["messages"]
-    user_input = messages[-1].content if messages else ""
-    conversation_id = state.get("conversation_id", "unknown")
 
-    family_info = state.get("context", {}).get("family_info")
-    friends_info = state.get("context", {}).get("friends_info")
-
-    try:
-        result = execute_tools.save_preferences(
-            user_id="default_user",
-            preferences=user_input,
-            family_info=family_info,
-            friends_info=friends_info
-        )
-        
-        response_text = f"✅ 已为您保存偏好设置！\n\n您的偏好：{user_input[:50]}..."
-        if family_info:
-            response_text += f"\n\n家庭信息已更新：{family_info}"
-        if friends_info:
-            response_text += f"\n\n朋友信息已更新：{friends_info}"
-        response_text += "\n\n下次规划时我会考虑这些信息！"
-
-        return {
-            "messages": [AIMessage(content=response_text)],
-            "intent_type": "preferences",
-            "conversation_id": conversation_id
-        }
-    except Exception as e:
-        logger.error(f"保存偏好失败 | conversation_id={conversation_id} | error={str(e)}")
-        return {
-            "messages": [AIMessage(content=f"保存偏好时出错：{str(e)}")],
-            "conversation_id": conversation_id
-        }
-
-async def agent_node(state: AgentState):
-    """Agent主节点"""
-    messages = state["messages"]
-    preferences = state.get("preferences", "")
-    intent_type = state.get("intent_type")
-    current_skill = state.get("current_skill")
-    conversation_id = state.get("conversation_id", "unknown")
-
-    chat_history = []
-    for msg in messages[:-1]:
-        if isinstance(msg, HumanMessage):
-            chat_history.append(f"用户: {msg.content}")
-        elif isinstance(msg, AIMessage):
-            chat_history.append(f"助手: {msg.content}")
-
-    system_msg = prompts["system_prompt"]
-    system_msg += "\n\n你是一个专业的活动规划助手，名为'小团'。"
-
-    if preferences:
-        system_msg += "\n" + prompts["preference_prompt"].format(preferences=preferences)
-
-    if chat_history:
-        system_msg += "\n\n对话历史:\n" + "\n".join(chat_history[-6:])
-
-    system_msg += "\n\n请根据用户的需求和上下文，提供专业的活动规划建议。"
-
-    user_message = messages[-1].content if messages else ""
-
-    try:
-        if not llm_manager.has_llms():
-            error_msg = """
-抱歉，当前系统没有配置可用的LLM服务！
-
-请检查 `backend/config/llm_config.json` 文件，确保已正确配置至少一个LLM的API密钥：
-
-示例配置：
-{
-  "name": "xiaomi",
-  "model": "mimo-v2.5-pro",
-  "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
-  "api_key": "your-api-key-here",
-  "temperature": 0.7
-}
-
-配置完成后，请重启后端服务。
-"""
-            return {
-                "messages": [AIMessage(content=error_msg)],
-                "conversation_id": conversation_id
-            }
-
-        logger.info(f"调用LLM | conversation_id={conversation_id}")
-        agent_logger.llm_invoking(conversation_id)
-
-        response = await llm_manager.invoke(
-            [SystemMessage(content=system_msg), HumanMessage(content=user_message)]
-        )
-
-        agent_logger.llm_response(conversation_id, len(response.content))
-        logger.info(f"LLM响应完成 | conversation_id={conversation_id} | length={len(response.content)}")
-
-        return {
-            "messages": [response],
-            "intent_type": intent_type,
-            "current_skill": current_skill,
-            "conversation_id": conversation_id
-        }
-    except Exception as e:
-        error_msg = f"抱歉，处理时出现错误: {str(e)}\n\n请检查LLM配置是否正确。"
-        logger.error(f"Agent节点错误 | conversation_id={conversation_id} | error={str(e)}")
-        return {
-            "messages": [AIMessage(content=error_msg)],
-            "conversation_id": conversation_id
-        }
-
-def should_handle_preferences(state: AgentState) -> Literal["handle_preferences", "agent"]:
-    """判断是否需要处理偏好设置"""
-    if state.get("intent_type") == "preferences":
-        return "handle_preferences"
-    return "agent"
-
-def should_execute_skill(state: AgentState) -> Literal["execute_skill", END]:
-    """决定是否执行skill"""
-    if state.get("current_skill"):
-        return "execute_skill"
+def route_after_preferences(state: AgentState) -> Literal["query_data", "END"]:
+    intent_type = state.get("intent_type", "general")
+    if intent_type == "planning":
+        logger.info(f"[路由] extract_preferences → query_data")
+        return "query_data"
+    logger.info(f"[路由] extract_preferences → END")
     return END
 
-def execute_skill_node(state: AgentState):
-    """执行skill节点 - 查询数据并生成方案"""
-    current_skill = state.get("current_skill")
-    conversation_id = state.get("conversation_id", "unknown")
 
-    if not current_skill:
-        return {"messages": []}
+def route_after_full_replan(state: AgentState) -> Literal["query_data", "END"]:
+    if state.get("intent_type") == "planning":
+        logger.info(f"[路由] full_replan → query_data")
+        return "query_data"
+    return END
 
-    logger.info(f"开始执行Skill | conversation_id={conversation_id} | skill={current_skill}")
 
-    try:
-        if "Parent-Child" in current_skill:
-            scenario = "family"
-        elif "Friends" in current_skill:
-            scenario = "friends"
-        elif "Personal" in current_skill:
-            scenario = "couple"
-        else:
-            scenario = None
-
-        if scenario:
-            result = query_tools.recommend_by_scenario(scenario)
-            plan_id = f"plan_{hash(conversation_id) % 1000:03d}"
-            
-            response_text = f"\n\n📍 **方案推荐完成**\n\n场景: {result.get('scenario', '')}\n\n"
-            
-            attractions = result.get('attractions', [])[:2]
-            restaurants = result.get('restaurants', [])[:2]
-            
-            for i, attr in enumerate(attractions, 1):
-                response_text += f"{i}. 🎯 {attr.get('name', '')}\n"
-                response_text += f"   类型: {attr.get('type', '')}\n"
-                response_text += f"   地址: {attr.get('address', '')[:20]}...\n"
-                response_text += f"   评分: {attr.get('rating', '')}\n\n"
-            
-            for i, rest in enumerate(restaurants, 1):
-                response_text += f"{i}. 🍽️ {rest.get('name', '')}\n"
-                response_text += f"   菜系: {rest.get('cuisine', '')}\n"
-                response_text += f"   人均: {rest.get('price_per_person', '')}元\n\n"
-            
-            response_text += f"方案ID: {plan_id}\n"
-            response_text += "\n需要我帮您预订吗？\n\n⚠️ 所有预订操作都需要您亲自确认。"
-            
-            return {
-                "messages": [AIMessage(content=response_text)],
-                "plan_id": plan_id
-            }
-        else:
-            return {"messages": []}
-
-    except Exception as e:
-        logger.error(f"Skill执行错误 | conversation_id={conversation_id} | error={str(e)}")
-        return {"messages": [AIMessage(content=f"执行时出错: {str(e)}")]}
+# ==================== 图构建 ====================
 
 def build_graph():
-    """构建Agent图"""
-    logger.info("开始构建Agent图...")
+    """构建 Agent 图 v2"""
+    logger.info("开始构建 Agent 图 v2...")
 
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("analyze_intent", analyze_intent)
-    workflow.add_node("handle_preferences", handle_preferences)
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("execute_skill", execute_skill_node)
+    # 注册所有节点
+    nodes = [
+        ("analyze_intent", node_analyze_intent),
+        ("general_response", node_general_response),
+        ("extract_preferences", node_extract_preferences),
+        ("query_data", node_query_data),
+        ("planner", node_planner),
+        ("replace_activity", node_replace_activity),
+        ("partial_replan", node_partial_replan),
+        ("full_replan", node_full_replan),
+    ]
+    for name, func in nodes:
+        workflow.add_node(name, func)
 
+    # 入口
     workflow.set_entry_point("analyze_intent")
-    workflow.add_conditional_edges(
-        "analyze_intent",
-        should_handle_preferences,
-        {
-            "handle_preferences": "handle_preferences",
-            "agent": "agent"
-        }
-    )
-    workflow.add_edge("handle_preferences", END)
-    workflow.add_conditional_edges(
-        "agent",
-        should_execute_skill,
-        {
-            "execute_skill": "execute_skill",
-            END: END
-        }
-    )
-    workflow.add_edge("execute_skill", END)
+
+    # 路由
+    workflow.add_conditional_edges("analyze_intent", route_after_intent, {
+        "general_response": "general_response",
+        "extract_preferences": "extract_preferences",
+        "query_data": "query_data",
+        "replace_activity": "replace_activity",
+        "partial_replan": "partial_replan",
+        "full_replan": "full_replan",
+    })
+    workflow.add_edge("general_response", END)
+    workflow.add_conditional_edges("extract_preferences", route_after_preferences, {
+        "query_data": "query_data", END: END,
+    })
+    workflow.add_edge("query_data", "planner")
+    workflow.add_edge("planner", END)
+    workflow.add_edge("replace_activity", END)
+    workflow.add_edge("partial_replan", END)
+    workflow.add_conditional_edges("full_replan", route_after_full_replan, {
+        "query_data": "query_data", END: END,
+    })
 
     checkpointer = MemorySaver()
     compiled_graph = workflow.compile(checkpointer=checkpointer)
 
-    logger.info("Agent图构建完成")
-    logger.info("节点流程: analyze_intent -> [handle_preferences | agent] -> [execute_skill | end]")
-
+    logger.info("Agent 图 v2 构建完成（8节点 + 流式LLM + 增强日志）")
     return compiled_graph
 
-__all__ = ["build_graph", "llm_manager"]
+
+__all__ = ["build_graph", "llm_manager", "LLMManager"]

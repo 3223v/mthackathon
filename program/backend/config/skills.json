@@ -1,0 +1,29 @@
+[
+  {
+    "id": "Parent-ChildTravelPlanning",
+    "name": "亲子出行规划",
+    "skill_file": "skills/Parent-ChildTravelPlanning/Parent-ChildTravelPlanning.md",
+    "trigger_keywords": ["孩子", "亲子", "带娃", "家庭", "遛娃", "小孩", "宝宝", "儿童", "幼儿园", "小学"],
+    "trigger_scenarios": ["family", "parent_child"],
+    "scenario": "family",
+    "description": "为有孩子的家庭规划游玩活动，考虑儿童友好设施和合理节奏"
+  },
+  {
+    "id": "FriendsOuting",
+    "name": "朋友出行规划",
+    "skill_file": "skills/FriendsOuting/FriendsOuting.md",
+    "trigger_keywords": ["朋友", "聚会", "多人", "团建", "聚餐", "兄弟", "闺蜜", "同学", "同事", "伙伴"],
+    "trigger_scenarios": ["friends", "group"],
+    "scenario": "friends",
+    "description": "为朋友/多人团体规划聚会活动，平衡多人兴趣和预算"
+  },
+  {
+    "id": "PersonalTravelPlanning",
+    "name": "情侣/个人出行规划",
+    "skill_file": "skills/PersonalTravelPlanning/PersonalTravelPlanning.md",
+    "trigger_keywords": ["约会", "对象", "浪漫", "女朋友", "男朋友", "老婆", "老公", "情侣", "一个人", "独自", "个人"],
+    "trigger_scenarios": ["couple", "solo", "personal"],
+    "scenario": "couple",
+    "description": "为情侣约会或个人休闲出行规划浪漫/舒适的活动"
+  }
+]

@@ -1,0 +1,7 @@
+[
+  {"id":"CF4001","name":"星巴克（三里屯太古里店）","type":"chain","location":{"lng":116.461,"lat":39.935},"address":"北京市朝阳区三里屯路19号太古里南区","rating":4.2,"price_per_person":45,"opening_hours":"07:00-23:00","tags":["咖啡","休息","办公"],"suitable_for":["solo","friends","couple"],"availability":null},
+  {"id":"CF4002","name":"% Arabica（798店）","type":"specialty","location":{"lng":116.502,"lat":39.985},"address":"北京市朝阳区酒仙桥路2号798艺术区","rating":4.6,"price_per_person":55,"opening_hours":"09:00-19:00","tags":["精品咖啡","网红","拍照"],"suitable_for":["solo","couple","friends"],"availability":null},
+  {"id":"CF4003","name":"奈雪的茶（西单大悦城店）","type":"tea","location":{"lng":116.378,"lat":39.913},"address":"北京市西城区西单北大街131号","rating":4.3,"price_per_person":35,"opening_hours":"10:00-22:00","tags":["奶茶","面包","休息"],"suitable_for":["solo","friends","couple","family"],"availability":null},
+  {"id":"CF4004","name":"喜茶（朝阳大悦城店）","type":"tea","location":{"lng":116.521,"lat":39.928},"address":"北京市朝阳区朝阳北路101号朝阳大悦城B1","rating":4.4,"price_per_person":30,"opening_hours":"10:00-22:00","tags":["奶茶","水果茶","排队"],"suitable_for":["solo","friends","couple"],"availability":null},
+  {"id":"CF4005","name":"静水咖啡（鼓楼店）","type":"specialty","location":{"lng":116.404,"lat":39.942},"address":"北京市东城区鼓楼东大街69号","rating":4.7,"price_per_person":50,"opening_hours":"10:00-19:00","tags":["手冲","安静","胡同","文艺"],"suitable_for":["solo","couple"],"availability":null}
+]

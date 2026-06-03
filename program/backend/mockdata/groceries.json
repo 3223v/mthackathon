@@ -1,0 +1,20 @@
+[
+  {
+    "id": "GR001",
+    "name": "百果园（朝阳大悦城店）",
+    "type": "fruit",
+    "location": {"lng": 116.521, "lat": 39.928},
+    "address": "B1层",
+    "rating": 4.7,
+    "price_level": "中",
+    "opening_hours": "09:00-21:00",
+    "tags": ["水果", "切盘"],
+    "suitable_for": ["family", "diet"],
+    "healthy_products": ["低糖水果拼盘"],
+    "availability": {
+      "2025-06-03": {
+        "水果拼盘": {"available_count": 5, "preparation_minutes": 10}
+      }
+    }
+  }
+]
