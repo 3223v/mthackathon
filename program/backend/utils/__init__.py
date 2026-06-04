@@ -7,7 +7,9 @@ from .logger import (
     logger,
     ws_logger,
     agent_logger,
-    api_logger
+    api_logger,
+    truncate_for_console,
+    log_node_io,
 )
 
 __all__ = [
@@ -19,5 +21,7 @@ __all__ = [
     "logger",
     "ws_logger",
     "agent_logger",
-    "api_logger"
+    "api_logger",
+    "truncate_for_console",
+    "log_node_io",
 ]

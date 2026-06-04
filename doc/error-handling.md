@@ -101,16 +101,35 @@ class LLMManager:
 | 2 | 3s |
 | 3 | 4.5s |
 
-### 2.2 LLM 响应解析错误处理
+### 2.2 LLM 响应解析错误处理（三层保底策略 v3）
 
-#### 2.2.1 JSON 解析失败
+#### 2.2.1 总体策略
+
+```
+Layer 1: Native json_schema + strict=True（OpenAI 原生结构化输出）
+    ↓ 失败
+Layer 2: Function Calling + tool_choice="required"
+    ↓ 失败
+Layer 3: 文本流式输出 + 多策略 JSON 解析 + 自动重试（最多3次）
+```
+
+#### 2.2.2 结构化输出 Schema
+
+见 `agent/schemas.py`，使用 Pydantic BaseModel 定义精确的输出结构，包含活动类型、时间段、位置、详情、预订信息等完整字段。
+
+#### 2.2.3 JSON 解析（Layer 3 保底）
 
 ```python
 def _parse_plan_json(text: str) -> List[Dict]:
-    """从 LLM 输出中解析 plan JSON"""
-    # 尝试从 markdown 代码块提取
-    code_match = re.search(r'```(?:json)?\s*\n?(.*?)```', text, re.DOTALL)
-    if code_match:
+    """从 LLM 输出中解析 plan JSON — 多策略 + 容错"""
+    # 策略1: 提取 markdown ```json ... ``` 代码块
+    # 策略2: 直接 JSON 解析（支持 {"activities": [...]} 或 [...]）
+    # 策略3: 平衡括号匹配提取最外层数组 + JSON 容错修复
+    #   - 移除尾部逗号
+    #   - 移除注释（// 和 /* */）
+    #   - 重新尝试解析
+    # 策略4: 回退到原始文本提取
+```
         text = code_match.group(1).strip()
     
     try:

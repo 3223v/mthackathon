@@ -1,10 +1,10 @@
 """
-重规划节点 v2
+重规划节点 v3
 
-三种重规划 + 流式LLM输出 + 增强日志
+三种重规划 + 流式LLM输出 + 结构化输出保底
 
 1. replace_activity — 约束求解替换单活动
-2. partial_replan — 保留前N个，重新规划后续
+2. partial_replan — 保留前N个，重新规划后续（三层结构化输出）
 3. full_replan — 清空方案，触发完整重规划
 """
 
@@ -12,9 +12,11 @@ import json
 import re
 import os
 from typing import Dict, Any, List, Optional, Callable, Awaitable
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agent.state import AgentState
 from agent.nodes.query import format_data_for_prompt
+from agent.nodes.planner import _parse_plan_json
+from agent.schemas import PartialReplanOutput
 from core.travel import calculate_route
 from tools.query_tools import QueryTools
 from utils import logger
@@ -133,33 +135,61 @@ async def partial_replan(
         available_data=format_data_for_prompt(query_results),
     )
 
-    try:
-        response_text = await llm_manager.invoke_with_logging(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            stream_callback=stream_callback,
-            log_prefix="PartialReplan",
-        )
+    # 三层保底：结构化输出优先 → 文本解析 → 重试
+    new_part = []
+    max_retries = 2
 
-        code_match = re.search(r'```(?:json)?\s*\n?(.*?)```', response_text, re.DOTALL)
-        json_text = code_match.group(1) if code_match else response_text
-        array_match = re.search(r'\[.*\]', json_text, re.DOTALL)
-        new_part = json.loads(array_match.group(0)) if array_match else []
+    msg_list = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
 
-        full_plan = kept + new_part
-        for i, act in enumerate(full_plan):
-            act["order"] = i + 1
+    for retry_attempt in range(max_retries + 1):
+        # Layer 1+2: 结构化输出
+        if retry_attempt == 0:
+            try:
+                structured = await llm_manager.invoke_structured(msg_list, PartialReplanOutput)
+                if structured and hasattr(structured, 'activities'):
+                    new_part = [a.model_dump() if hasattr(a, 'model_dump') else a for a in structured.activities]
+                    logger.info(f"PartialReplan 结构化输出成功 | activities={len(new_part)}")
+                    break
+            except Exception as e:
+                logger.warning(f"PartialReplan 结构化输出失败 | error={str(e)[:100]}")
 
-        logger.info(f"部分重规划完成 | total_items={len(full_plan)}")
+        # Layer 3: 文本解析
+        try:
+            retry_suffix = "\n\n⚠️ 上次输出JSON格式有误，请务必只输出纯JSON数组。" if retry_attempt > 0 else ""
+            response_text = await llm_manager.invoke_with_logging(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt + retry_suffix,
+                stream_callback=stream_callback,
+                log_prefix=f"PartialReplan(attempt{retry_attempt+1})",
+            )
+            new_part = _parse_plan_json(response_text)
+            if new_part:
+                logger.info(f"PartialReplan JSON解析成功 | activities={len(new_part)} | attempt={retry_attempt+1}")
+                break
+            else:
+                logger.warning(f"PartialReplan JSON解析失败 | attempt={retry_attempt+1}")
+        except Exception as e:
+            logger.error(f"PartialReplan LLM调用失败 | attempt={retry_attempt+1} | error={str(e)}")
+            if retry_attempt >= max_retries:
+                return {"messages": [AIMessage(content=f"部分重规划失败：{str(e)}")]}
 
-        return {
-            "plan": full_plan,
-            "messages": [AIMessage(content=f"✅ 已从第{split_index+1}个活动之后重新规划，共{len(full_plan)}个活动。")],
-        }
+    if not new_part:
+        logger.error(f"部分重规划完全失败（{max_retries+1}次尝试）")
+        return {"messages": [AIMessage(content="部分重规划多次尝试均失败，请尝试全量重规划或简化需求。")]}
 
-    except Exception as e:
-        logger.error(f"部分重规划失败 | error={str(e)}")
-        return {"messages": [AIMessage(content=f"部分重规划失败：{str(e)}")]}
+    full_plan = kept + new_part
+    for i, act in enumerate(full_plan):
+        act["order"] = i + 1
+
+    logger.info(f"部分重规划完成 | total_items={len(full_plan)}")
+
+    return {
+        "plan": full_plan,
+        "messages": [AIMessage(content=f"✅ 已从第{split_index+1}个活动之后重新规划，共{len(full_plan)}个活动。")],
+    }
 
 
 # ==================== 全量重规划 ====================

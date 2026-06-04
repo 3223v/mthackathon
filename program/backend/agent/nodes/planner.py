@@ -11,12 +11,13 @@ import json
 import re
 import os
 import hashlib
-from typing import Dict, Any, List, Optional, Callable, Awaitable
+from typing import Dict, Any, List, Optional, Callable, Awaitable, Union
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agent.state import AgentState
 from agent.nodes.query import format_data_for_prompt
 from core.travel import calculate_route
 from mockfunction import get_user_preferences_for_planning
+from agent.schemas import PlanOutput, PlanActivity as SchemaPlanActivity
 from utils import logger, agent_logger
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../../config/prompts.json")
@@ -83,31 +84,79 @@ async def generate_plan(
     if time_constraint_text:
         user_prompt += time_constraint_text
 
-    # 3. 调用 LLM（流式）
-    try:
+    # 3. 调用 LLM — 流式优先 + 后置校验 + 重试时用结构化输出
+    plan = None
+    response_text = ""
+    is_retry = state.get("planner_parse_failed", False)
+
+    prompt_messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+
+    # --- 重试模式：直接用非流式结构化输出（前端已经看过流式文本了） ---
+    if is_retry:
+        logger.info(f"Planner 重试模式 | cid={conversation_id} | 使用非流式结构化输出")
+        # 追加之前的原始响应作为上下文提示
+        raw_prev = state.get("planner_raw_response", "")
+        if raw_prev:
+            user_prompt += f"\n\n## 参考（上次输出，JSON格式有问题，请修正后重新输出）\n{raw_prev[:1500]}"
+
+        # Layer 1+2: 结构化输出
+        structured_result = await llm_manager.invoke_structured(prompt_messages, PlanOutput)
+        if structured_result and hasattr(structured_result, 'activities'):
+            plan_raw = []
+            for act in structured_result.activities:
+                act_dict = act.model_dump() if hasattr(act, 'model_dump') else act
+                plan_raw.append(act_dict)
+            plan = plan_raw
+            logger.info(f"重试结构化输出成功 | activities={len(plan)}")
+            if stream_callback:
+                await stream_callback(f"[校验通过 ✓ 生成{len(plan)}个活动]")
+        else:
+            # 结构化也失败，降级到流式重试一次
+            logger.warning(f"重试结构化输出失败，降级到流式文本")
+            response_text = await llm_manager.invoke_with_logging(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt + "\n\n⚠️ 请务必只输出纯JSON数组，不要markdown标记，不要解释文字。",
+                stream_callback=stream_callback,
+                log_prefix="Planner(retry_text)",
+            )
+            plan = _parse_plan_json(response_text)
+
+    # --- 首次模式：流式输出到前端 → 后置校验 ---
+    else:
+        logger.info(f"Planner 流式模式 | cid={conversation_id}")
         response_text = await llm_manager.invoke_with_logging(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             stream_callback=stream_callback,
             log_prefix="Planner",
         )
-    except Exception as e:
-        logger.error(f"规划生成失败 | cid={conversation_id} | error={str(e)}")
-        return {
-            "messages": [AIMessage(content=f"抱歉，规划生成失败：{str(e)}")],
-            "plan": [],
-            "plan_id": "",
-        }
+        plan = _parse_plan_json(response_text)
 
-    # 4. 解析 JSON
-    plan = _parse_plan_json(response_text)
+    # --- 后置校验：JSON 解析失败 → 标记需要重试 ---
     if not plan:
-        logger.warning(f"JSON解析失败，返回原始文本 | cid={conversation_id}")
-        return {
-            "messages": [AIMessage(content=response_text)],
-            "plan": [],
-            "plan_id": "",
-        }
+        logger.warning(f"Planner JSON解析失败 | cid={conversation_id} | is_retry={is_retry}")
+        if not is_retry:
+            # 首次失败：返回标记让 WebSocket 层触发倒计时重试
+            return {
+                "messages": [AIMessage(content=response_text or "方案生成中...")],
+                "plan": [],
+                "plan_id": "",
+                "planner_parse_failed": True,
+                "planner_raw_response": response_text,
+            }
+        else:
+            # 重试也失败：彻底放弃
+            logger.error(f"Planner 重试后仍失败 | cid={conversation_id}")
+            return {
+                "messages": [AIMessage(content=response_text or "抱歉，多次尝试仍无法生成有效方案，请简化需求后重试。")],
+                "plan": [],
+                "plan_id": "",
+                "planner_parse_failed": False,
+                "planner_raw_response": "",
+            }
 
     # 5. 后处理：插入交通活动 + 补全信息
     plan = _insert_transport_activities(plan)
@@ -120,6 +169,8 @@ async def generate_plan(
         "plan": plan,
         "plan_id": plan_id,
         "messages": [AIMessage(content=display_text)],
+        "planner_parse_failed": False,
+        "planner_raw_response": "",
     }
 
 
@@ -135,29 +186,115 @@ def _build_scenario_description(skill: Dict) -> str:
 
 
 def _parse_plan_json(text: str) -> List[Dict]:
-    """从 LLM 输出中解析 plan JSON"""
+    """从 LLM 输出中解析 plan JSON（多策略 + 容错 + 详细诊断）"""
+    original = text
+
+    # 清理 BOM 和零宽字符
+    text = text.lstrip('﻿​‌‍⁠')
+
+    # 策略1: 提取 markdown ```json ... ``` 代码块
     code_match = re.search(r'```(?:json)?\s*\n?(.*?)```', text, re.DOTALL)
     if code_match:
         text = code_match.group(1).strip()
+        logger.debug(f"从markdown代码块提取JSON | length={len(text)}")
 
+    # 策略2: 直接 JSON 解析
     try:
         plan = json.loads(text)
         if isinstance(plan, list):
             return plan
-    except json.JSONDecodeError:
-        pass
+        elif isinstance(plan, dict) and 'activities' in plan:
+            return plan['activities']
+    except json.JSONDecodeError as e:
+        near = text[max(0, e.pos-40):e.pos+40] if e.pos < len(text) else text[-80:]
+        logger.debug(f"策略2 直接解析失败 | pos={e.pos} | msg={e.msg} | near='{near}'")
 
-    array_match = re.search(r'\[.*\]', text, re.DOTALL)
-    if array_match:
+    # 策略3: 使用平衡括号匹配提取最外层数组
+    array_text = _extract_json_array(text)
+    if array_text:
         try:
-            plan = json.loads(array_match.group(0))
+            plan = json.loads(array_text)
             if isinstance(plan, list):
+                logger.info(f"策略3 平衡括号提取成功 | items={len(plan)}")
                 return plan
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            near = array_text[max(0, e.pos-40):e.pos+40] if e.pos < len(array_text) else array_text[-80:]
+            logger.warning(f"策略3 数组提取后解析失败 | pos={e.pos} | msg={e.msg} | near='{near}'")
+            # 策略3b: 尝试修复常见问题
+            fixed = _fix_common_json_errors(array_text)
+            if fixed != array_text:
+                try:
+                    plan = json.loads(fixed)
+                    if isinstance(plan, list):
+                        logger.info("策略3b JSON修复成功")
+                        return plan
+                except json.JSONDecodeError as e2:
+                    logger.debug(f"策略3b 修复后仍失败 | msg={e2.msg}")
 
-    logger.warning(f"无法解析 plan JSON | preview={text[:200]}")
+    # 策略4: 从原始文本中提取
+    if text != original:
+        array_text = _extract_json_array(original)
+        if array_text:
+            try:
+                plan = json.loads(array_text)
+                if isinstance(plan, list):
+                    logger.info("策略4 从原始文本提取成功")
+                    return plan
+            except json.JSONDecodeError:
+                pass
+
+    # 详细诊断日志
+    logger.warning(f"无法解析 plan JSON | text_len={len(text)} | preview={text[:400]}")
+    # 检查是否有不可见字符
+    invisible = [c for c in text if ord(c) < 32 and c not in '\n\r\t']
+    if invisible:
+        logger.warning(f"发现不可见字符: {[f'U+{ord(c):04X}' for c in invisible[:10]]}")
     return []
+
+
+def _extract_json_array(text: str) -> Optional[str]:
+    """使用平衡括号匹配提取最外层 JSON 数组"""
+    # 找到第一个 '['
+    start = text.find('[')
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\':
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
+
+def _fix_common_json_errors(text: str) -> str:
+    """修复常见的 LLM JSON 输出错误"""
+    import re as re_mod
+    # 1. 移除尾部逗号（在 ] 或 } 之前）
+    text = re_mod.sub(r',\s*([}\]])', r'\1', text)
+    # 2. 移除注释（// 和 /* */ 风格）
+    text = re_mod.sub(r'//.*?$', '', text, flags=re_mod.MULTILINE)
+    text = re_mod.sub(r'/\*.*?\*/', '', text, flags=re_mod.DOTALL)
+    # 3. 移除尾部多余文本（在最后一个 ] 或 } 之后）
+    # 已经由 _extract_json_array 处理
+    return text
 
 
 def _insert_transport_activities(plan: List[Dict]) -> List[Dict]:

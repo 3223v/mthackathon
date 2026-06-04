@@ -48,3 +48,7 @@ class AgentState(TypedDict):
     # === 会话 ===
     conversation_id: str                               # 会话 ID
     context: Dict[str, Any]                            # 额外上下文
+
+    # === 校验与重试 ===
+    planner_parse_failed: bool                         # planner JSON 解析是否失败
+    planner_raw_response: str                          # planner 原始响应文本（用于重试时注入提示）

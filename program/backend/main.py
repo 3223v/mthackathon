@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from agent.graph import build_graph, llm_manager
+from agent.nodes.alternatives import generate_alternatives_graph, generate_plan_matrix
+from agent.nodes.planner import generate_plan
 from langchain_core.messages import HumanMessage
 from mockfunction import (
     book_restaurant, book_ticket, order_delivery,
@@ -57,6 +59,10 @@ async def root():
             "orders_execute_all": "POST /api/orders/execute",
             "orders_execute_one": "POST /api/orders/execute/{order_index}",
             "orders_pending": "GET /api/orders/pending/{plan_id}",
+            "plan_alternatives": "POST /api/plan/alternatives",
+            "plan_matrix": "POST /api/plan/matrix",
+            "plan_reroute_matrix": "POST /api/plan/reroute-matrix",
+            "plan_reroute": "POST /api/plan/reroute",
         }
     }
 
@@ -307,8 +313,6 @@ async def get_alternatives(payload: AlternativesRequest):
     - 用户点击任意节点可切换到替代方案
     - 切换后自动重算受影响的交通边
     """
-    from agent.nodes.alternatives import generate_alternatives_graph
-
     if not llm_manager.has_llms():
         raise HTTPException(status_code=503, detail="LLM 服务不可用")
 
@@ -326,6 +330,122 @@ async def get_alternatives(payload: AlternativesRequest):
     except Exception as e:
         logger.error(f"替代方案生成失败 | error={str(e)}")
         raise HTTPException(status_code=500, detail=f"替代方案生成失败: {str(e)}")
+
+
+@app.post("/api/plan/matrix", response_model=Dict[str, Any])
+async def get_plan_matrix(payload: AlternativesRequest):
+    """
+    生成二维矩阵：横向是 plan 中的每个节点位置（含交通），纵向是原始+替代方案。
+
+    返回结构：
+    {
+      "plan_id": "...",
+      "matrix": [
+        [{id, label, is_original, activity, transport_info?}, ...],  # 第0列
+        [{id, label, is_original, activity, transport_info?}, ...],  # 第1列
+        ...
+      ],
+      "column_labels": ["活动: 故宫", "交通: 打车→海底捞", ...],
+      "column_types": ["activity", "transport", ...],
+    }
+
+    前端使用方式：
+    - 矩阵中每列选择一个节点，形成完整路径
+    - 选中的节点序列 POST 到 /api/plan/reroute-matrix 获取完整 plan
+    """
+    if not llm_manager.has_llms():
+        raise HTTPException(status_code=503, detail="LLM 服务不可用")
+
+    logger.info(f"生成矩阵 | plan_id={payload.plan_id} | top_k={payload.top_k}")
+
+    try:
+        matrix_result = await generate_plan_matrix(
+            plan=payload.plan,
+            plan_id=payload.plan_id,
+            llm_manager=llm_manager,
+            top_k=payload.top_k,
+        )
+        return matrix_result
+    except Exception as e:
+        logger.error(f"矩阵生成失败 | error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"矩阵生成失败: {str(e)}")
+
+
+@app.post("/api/plan/reroute-matrix", response_model=Dict[str, Any])
+async def reroute_matrix_path(payload: Dict[str, Any]):
+    """
+    用户从矩阵中选择路径后，根据选中的节点ID序列重新计算完整行程。
+
+    请求：
+    {
+      "plan_id": "...",
+      "selected_ids": ["n0", "t1_alt1", "n2_alt0"],  # 每列选一个节点的ID
+      "matrix": [...],   # 完整的矩阵数据
+    }
+
+    返回：
+    {
+      "plan": [...],  # 完整的活动+交通行程
+    }
+    """
+    selected_ids = payload.get("selected_ids", [])
+    matrix = payload.get("matrix", [])
+
+    if not selected_ids:
+        raise HTTPException(status_code=400, detail="selected_ids 不能为空")
+    if not matrix:
+        raise HTTPException(status_code=400, detail="matrix 不能为空")
+
+    # 构建 ID → node 映射
+    id_to_node = {}
+    for column in matrix:
+        for node in column:
+            id_to_node[node["id"]] = node
+
+    plan = []
+    for i, node_id in enumerate(selected_ids):
+        node = id_to_node.get(node_id)
+        if not node:
+            continue
+        activity = node.get("activity", {})
+        activity = {**activity}  # 浅拷贝
+        activity["order"] = len(plan) + 1
+        plan.append(activity)
+
+        # 如果不是最后一个，插入交通（从当前节点的 activity.location 到下一个节点的 activity.location）
+        if i < len(selected_ids) - 1:
+            next_node = id_to_node.get(selected_ids[i + 1])
+            if next_node:
+                curr_loc = activity.get("location", {})
+                next_act = next_node.get("activity", {})
+                next_loc = next_act.get("location", {})
+
+                if curr_loc and next_loc:
+                    from core.travel import calculate_route
+                    route = calculate_route(
+                        curr_loc.get("lat", 0), curr_loc.get("lng", 0),
+                        next_loc.get("lat", 0), next_loc.get("lng", 0),
+                    )
+                    transport = {
+                        "order": len(plan) + 1,
+                        "activity_type": "transport",
+                        "name": f"{route['mode_label']}前往{next_act.get('name', '下一站')}",
+                        "from_location": {"lat": curr_loc.get("lat"), "lng": curr_loc.get("lng"), "name": activity.get("name", "")},
+                        "to_location": {"lat": next_loc.get("lat"), "lng": next_loc.get("lng"), "name": next_act.get("name", "")},
+                        "duration_minutes": route["duration_minutes"],
+                        "distance_m": route["distance_m"],
+                        "mode": route["mode"],
+                        "mode_label": route["mode_label"],
+                        "mode_icon": route["mode_icon"],
+                        "location": {"lat": curr_loc.get("lat"), "lng": curr_loc.get("lng")},
+                        "details": {"description": f"{route['mode_label']}{route['duration_minutes']}分钟"},
+                        "pre_book": {"need": False},
+                        "delivery_sync": None,
+                    }
+                    plan.append(transport)
+
+    logger.info(f"矩阵路径重规划 | selected={selected_ids} | plan_len={len(plan)}")
+    return {"plan_id": payload.get("plan_id", ""), "plan": plan}
 
 
 @app.post("/api/plan/reroute", response_model=Dict[str, Any])
@@ -509,6 +629,8 @@ async def websocket_endpoint(websocket: WebSocket):
         "interrupt_info": "",
         "conversation_id": conversation_id,
         "context": {},
+        "planner_parse_failed": False,
+        "planner_raw_response": "",
     }
 
     config = {
@@ -582,7 +704,88 @@ async def websocket_endpoint(websocket: WebSocket):
                             "intent_type": state.get("intent_type", ""),
                         })
                         logger.info(f"[WS] 消息处理完成 | cid={conversation_id} | intent={state.get('intent_type')} | plan_len={len(state.get('plan', []))}")
-                        break  # 成功，退出重试循环
+
+                        # --- 后置校验：planner JSON 解析失败 → 倒计时重试 ---
+                        if state.get("planner_parse_failed", False):
+                            logger.info(f"[WS] JSON校验失败，启动3秒倒计时重试 | cid={conversation_id}")
+                            countdown = 3
+                            await websocket.send_json({
+                                "type": "plan_validation_failed",
+                                "countdown": countdown,
+                                "message": f"方案解析异常，{countdown}秒后自动重新生成...",
+                            })
+
+                            # 等待前端手动重试 或 倒计时超时
+                            retry_received = False
+                            try:
+                                retry_data = await asyncio.wait_for(
+                                    websocket.receive_json(),
+                                    timeout=float(countdown)
+                                )
+                                if retry_data.get("type") == "retry_planner":
+                                    retry_received = True
+                                    logger.info(f"[WS] 收到手动重试信号 | cid={conversation_id}")
+                                    await websocket.send_json({"type": "status", "content": "立即重新生成..."})
+                            except asyncio.TimeoutError:
+                                logger.info(f"[WS] 倒计时超时，自动重试 | cid={conversation_id}")
+                                await websocket.send_json({"type": "status", "content": "自动重新生成..."})
+
+                            # 直接重跑 planner 节点（不重新执行整张图，避免 analyze_intent 误判 raw JSON）
+                            try:
+                                # 构建 stream callback 用于重试过程的实时通知
+                                async def retry_stream_cb(token: str):
+                                    try:
+                                        await websocket.send_json({"type": "chunk", "content": token})
+                                    except Exception:
+                                        pass
+
+                                result = await generate_plan(state, llm_manager, stream_callback=retry_stream_cb)
+
+                                # 更新 state
+                                state.update(result)
+                                state["planner_parse_failed"] = result.get("planner_parse_failed", False)
+                                state["planner_raw_response"] = result.get("planner_raw_response", "")
+
+                                plan = result.get("plan", [])
+                                plan_id = result.get("plan_id", "")
+                                msgs = result.get("messages", [])
+
+                                if msgs:
+                                    await websocket.send_json({
+                                        "type": "ai_message",
+                                        "content": msgs[-1].content if hasattr(msgs[-1], 'content') else str(msgs[-1]),
+                                    })
+                                if plan:
+                                    await websocket.send_json({"type": "plan", "content": plan, "plan_id": plan_id})
+
+                                await websocket.send_json({
+                                    "type": "done",
+                                    "plan_id": plan_id,
+                                    "plan": plan,
+                                    "intent_type": state.get("intent_type", ""),
+                                })
+                                logger.info(f"[WS] 重试完成 | cid={conversation_id} | plan_len={len(plan)} | parse_ok={not result.get('planner_parse_failed')}")
+
+                                # 如果重试后仍然失败，让用户手动重试
+                                if result.get("planner_parse_failed"):
+                                    logger.warning(f"[WS] 重试后JSON仍无法解析 | cid={conversation_id}")
+                                    await websocket.send_json({
+                                        "type": "error",
+                                        "code": "PARSE_RETRY_FAILED",
+                                        "message": "多次尝试后方案解析仍失败，请尝试简化或调整需求。",
+                                        "retry": True,
+                                    })
+                            except Exception as retry_e:
+                                logger.error(f"[WS] 重试异常 | cid={conversation_id} | {str(retry_e)}")
+                                state["planner_parse_failed"] = False
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "code": "RETRY_FAILED",
+                                    "message": f"重新生成失败: {str(retry_e)[:150]}",
+                                    "retry": True,
+                                })
+
+                        break  # 成功（可能经过重试），退出循环
 
                     except Exception as e:
                         error_str = str(e)

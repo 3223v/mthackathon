@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import MatrixView from './MatrixView';
 
 interface Message {
   id: number;
@@ -116,6 +117,8 @@ export default function ChatInterface() {
   const [activityAlternatives, setActivityAlternatives] = useState<ActivityAlternatives>({});
   const [selectedNodeIds, setSelectedNodeIds] = useState<{ [key: number]: string }>({});
   const [isLoadingAlternatives, setIsLoadingAlternatives] = useState(false);
+  const [switchingAltIndex, setSwitchingAltIndex] = useState<number | null>(null);  // 正在切换的替代方案索引
+  const [transportAltIndices, setTransportAltIndices] = useState<{ [key: number]: number }>({});  // 交通替代方案索引
 
   // 下单相关
   const [showBookingForm, setShowBookingForm] = useState(false);
@@ -131,6 +134,14 @@ export default function ChatInterface() {
   const [bookingFieldErrors, setBookingFieldErrors] = useState<{[key: string]: string}>({});
   const [bookingResult, setBookingResult] = useState<{success: boolean; message: string; details?: string; orders?: any[]} | null>(null);
   const [isBookingLoading, setIsBookingLoading] = useState(false);
+
+  // 倒计时重试
+  const [retryCountdown, setRetryCountdown] = useState<number>(0);
+  const [retryMessage, setRetryMessage] = useState<string>('');
+  const countdownRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 矩阵视图
+  const [showMatrixView, setShowMatrixView] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -181,6 +192,7 @@ export default function ChatInterface() {
           if (data.content) {
             setCurrentPlan(data.content as PlanActivity[]);
             if (data.plan_id) setCurrentPlanId(data.plan_id);
+            setTransportAltIndices({});
           }
           break;
 
@@ -215,6 +227,7 @@ export default function ChatInterface() {
             setSelectedNodeIds({});
             setOrderedItems({});
             setSelectedItems({});
+            setTransportAltIndices({});
           }
           break;
 
@@ -223,11 +236,39 @@ export default function ChatInterface() {
           setIsStreaming(false);
           setStreamingContent('');
           setLastError(null);
+          // 清除倒计时
+          setRetryCountdown(0);
+          if (countdownRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; }
           if (data.plan && data.plan.length > 0) {
             setCurrentPlan(data.plan as PlanActivity[]);
             if (data.plan_id) setCurrentPlanId(data.plan_id);
             setShowPlanPanel(true);
+            setTransportAltIndices({});
           }
+          break;
+
+        case 'plan_validation_failed':
+          // JSON 校验失败 → 显示倒计时重试UI
+          const cd = data.countdown || 3;
+          const msg = data.message || '方案解析异常，即将自动重新生成...';
+          setRetryCountdown(cd);
+          setRetryMessage(msg);
+          addLog('error', msg);
+          // 清除旧计时器
+          if (countdownRef.current) clearInterval(countdownRef.current);
+          countdownRef.current = setInterval(() => {
+            setRetryCountdown(prev => {
+              if (prev <= 1) {
+                if (countdownRef.current) clearInterval(countdownRef.current);
+                // 自动发送重试
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(JSON.stringify({ type: 'retry_planner' }));
+                }
+                return 0;
+              }
+              return prev - 1;
+            });
+          }, 1000);
           break;
 
         case 'error':
@@ -260,8 +301,30 @@ export default function ChatInterface() {
     wsRef.current = ws;
 
     return () => {
+      if (countdownRef.current) clearInterval(countdownRef.current);
       ws.close();
     };
+  }, []);
+
+  // 监听矩阵视图返回的结果
+  useEffect(() => {
+    const handler = (e: CustomEvent) => {
+      const { plan: resultPlan, planId: resultPlanId } = e.detail;
+      if (resultPlan) {
+        setCurrentPlan(resultPlan);
+        if (resultPlanId) setCurrentPlanId(resultPlanId);
+        setShowPlanPanel(true);
+        setShowMatrixView(false);
+        addLog('plan_updated', '已应用矩阵路径方案');
+        // 重置替代方案相关状态
+        setDag(null);
+        setActivityAlternatives({});
+        setSelectedNodeIds({});
+        setTransportAltIndices({});
+      }
+    };
+    window.addEventListener('matrix_result', handler as EventListener);
+    return () => window.removeEventListener('matrix_result', handler as EventListener);
   }, []);
 
   const addLog = (type: AgentLog['type'], content: string, skillId?: string) => {
@@ -300,6 +363,15 @@ export default function ChatInterface() {
     setIsProcessing(true);
     setLastError(null);
     wsRef.current.send(JSON.stringify({ type: 'retry' }));
+  };
+
+  const sendRetryPlanner = () => {
+    if (!wsRef.current) return;
+    // 清除倒计时
+    if (countdownRef.current) clearInterval(countdownRef.current);
+    setRetryCountdown(0);
+    setIsProcessing(true);
+    wsRef.current.send(JSON.stringify({ type: 'retry_planner' }));
   };
 
   // ============== Top-K 替代方案 ==============
@@ -348,18 +420,16 @@ export default function ChatInterface() {
   const selectAlternative = async (activityIndex: number, nodeId: string) => {
     const newSelected = { ...selectedNodeIds, [activityIndex]: nodeId };
     setSelectedNodeIds(newSelected);
+    setSwitchingAltIndex(activityIndex);
 
-    if (!dag) return;
+    if (!dag) {
+      setSwitchingAltIndex(null);
+      return;
+    }
 
     // 构造新的 selected_nodes 序列
-    const nonTransportActivities = currentPlan.filter(a => a.activity_type !== 'transport');
-    const selected_nodes: string[] = [];
-
-    // 找到正确的顺序
     const sortedIndexes = Object.keys(newSelected).map(Number).sort((a, b) => a - b);
-    sortedIndexes.forEach(idx => {
-      selected_nodes.push(newSelected[idx]);
-    });
+    const selected_nodes: string[] = sortedIndexes.map(idx => newSelected[idx]);
 
     setIsProcessing(true);
     try {
@@ -378,16 +448,71 @@ export default function ChatInterface() {
       const result = await response.json();
       if (result.plan) {
         setCurrentPlan(result.plan);
-        addLog('plan_updated', '已切换到替代方案');
+        addLog('plan_updated', `已切换到「${result.plan.find((a: PlanActivity) =>
+          a.activity_type !== 'transport' &&
+          a.name === dag.nodes.find(n => n.id === nodeId)?.activity?.name
+        )?.name || '替代方案'}」`);
       } else {
         throw new Error('返回数据不包含 plan');
       }
     } catch (error: any) {
       console.error('重规划失败:', error);
-      alert(`切换方案失败: ${error?.message || '请重试'}`);
+      addLog('error', `切换方案失败: ${error?.message || '请重试'}`);
     } finally {
       setIsProcessing(false);
+      setSwitchingAltIndex(null);
     }
+  };
+
+  // 切换交通模式
+  const cycleTransportMode = (planIndex: number, direction: 'prev' | 'next') => {
+    const activity = currentPlan[planIndex];
+    if (activity.activity_type !== 'transport') return;
+    if (!activity.from_location || !activity.to_location) return;
+
+    const modes = ['walking', 'taxi', 'public_transit', 'driving'] as const;
+    const modeLabels: Record<string, string> = { walking: '步行', taxi: '打车', public_transit: '公共交通', driving: '自驾' };
+    const modeIcons: Record<string, string> = { walking: '🚶', taxi: '🚕', public_transit: '🚌', driving: '🚗' };
+    const speeds: Record<string, number> = { walking: 5, taxi: 35, public_transit: 25, driving: 30 };
+    const overheads: Record<string, number> = { walking: 0, taxi: 5, public_transit: 8, driving: 8 };
+
+    const currentMode = activity.mode || 'taxi';
+    const currentIdx = modes.indexOf(currentMode as any);
+    const newIdx = direction === 'next'
+      ? (currentIdx + 1) % modes.length
+      : (currentIdx - 1 + modes.length) % modes.length;
+    const newMode = modes[newIdx];
+
+    // Haversine distance
+    const lat1 = activity.from_location.lat;
+    const lng1 = activity.from_location.lng;
+    const lat2 = activity.to_location.lat;
+    const lng2 = activity.to_location.lng;
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distanceM = R * c;
+    const speed = speeds[newMode] || 35;
+    const overhead = overheads[newMode] || 5;
+    const durationMin = Math.max(1, Math.round(distanceM / 1000 / speed * 60) + overhead);
+
+    const updated = [...currentPlan];
+    updated[planIndex] = {
+      ...activity,
+      mode: newMode,
+      mode_label: modeLabels[newMode],
+      mode_icon: modeIcons[newMode],
+      duration_minutes: durationMin,
+      distance_m: Math.round(distanceM),
+      name: `${modeLabels[newMode]}前往${activity.to_location?.name || '下一站'}`,
+      details: { description: `${modeLabels[newMode]}${durationMin}分钟 (${(distanceM / 1000).toFixed(1)}km)` },
+    };
+    setCurrentPlan(updated);
+    setTransportAltIndices(prev => ({ ...prev, [planIndex]: newIdx }));
+
+    addLog('plan_updated', `交通方式切换为: ${modeLabels[newMode]} ${durationMin}分钟`);
   };
 
   // 获取某个活动的当前选中替代方案索引
@@ -591,13 +716,15 @@ export default function ChatInterface() {
     <div className="flex h-screen bg-gray-100">
       {/* 左侧：Agent 思考日志 */}
       <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
-        <div className="p-4 border-b border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-800">Agent 思考过程</h2>
-          <div className="flex items-center gap-2 mt-2">
-            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-            <span className="text-sm text-gray-500">
-              {isConnected ? '已连接' : '未连接'}
-            </span>
+        <div className="h-20 px-4 flex items-center border-b border-gray-200">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-800">Agent 思考过程</h2>
+            <div className="flex items-center gap-2 mt-1">
+              <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+              <span className="text-xs text-gray-500">
+                {isConnected ? '已连接' : '未连接'}
+              </span>
+            </div>
           </div>
         </div>
 
@@ -635,18 +762,12 @@ export default function ChatInterface() {
           )}
           <div ref={logsEndRef} />
         </div>
-
-        <div className="p-4 border-t border-gray-200 text-center">
-          <p className="text-xs text-gray-400">
-            💡 直接在对话中告诉小团你的偏好
-          </p>
-        </div>
       </div>
 
       {/* 中间：对话区域 */}
       <div className="flex-1 flex flex-col">
-        <header className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm">
-          <div className="flex items-center justify-between">
+        <header className="h-20 bg-white border-b border-gray-200 px-6 shadow-sm flex items-center">
+          <div className="flex items-center justify-between w-full">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-meituan-yellow rounded-full flex items-center justify-center">
                 <span className="text-xl">🎯</span>
@@ -658,14 +779,67 @@ export default function ChatInterface() {
                 </p>
               </div>
             </div>
-            {isProcessing && (
-              <div className="flex items-center gap-2 text-sm text-gray-600">
-                <div className="animate-spin w-4 h-4 border-2 border-meituan-yellow border-t-transparent rounded-full"></div>
-                处理中...
-              </div>
-            )}
+            <div className="flex items-center gap-3">
+              {isProcessing && (
+                <div className="flex items-center gap-2 text-sm text-gray-600">
+                  <div className="animate-spin w-4 h-4 border-2 border-meituan-yellow border-t-transparent rounded-full"></div>
+                  处理中...
+                </div>
+              )}
+              {/* 矩阵视图按钮 */}
+              {currentPlan.length > 0 && (
+                <button
+                  onClick={() => setShowMatrixView(true)}
+                  className="px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white text-sm rounded-lg hover:from-indigo-600 hover:to-purple-700 transition-all flex items-center gap-2 shadow-md"
+                  title="以二维矩阵方式查看和选择方案"
+                >
+                  🔗 矩阵视图
+                </button>
+              )}
+              {/* 方案面板切换按钮 */}
+              {currentPlan.length > 0 && (
+                <button
+                  onClick={() => setShowPlanPanel(!showPlanPanel)}
+                  className={`px-4 py-2 text-white text-sm rounded-lg transition-all flex items-center gap-2 shadow-sm ${
+                    showPlanPanel
+                      ? 'bg-gray-500 hover:bg-gray-600'
+                      : 'bg-blue-500 hover:bg-blue-600'
+                  }`}
+                >
+                  {showPlanPanel ? '✕ 隐藏方案' : '📋 查看方案'}
+                </button>
+              )}
+            </div>
           </div>
         </header>
+
+        {/* 倒计时重试横幅 */}
+        {retryCountdown > 0 && (
+          <div className="bg-amber-50 border-b border-amber-300 px-6 py-4">
+            <div className="flex items-center justify-between max-w-3xl mx-auto">
+              <div className="flex items-center gap-3">
+                <span className="text-2xl animate-pulse">⏳</span>
+                <div>
+                  <p className="text-amber-800 font-medium">{retryMessage}</p>
+                  <p className="text-amber-600 text-sm mt-0.5">
+                    将使用非流式结构化输出重新生成，确保方案格式正确
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-3xl font-bold text-amber-600 tabular-nums">
+                  {retryCountdown}
+                </span>
+                <button
+                  onClick={sendRetryPlanner}
+                  className="px-5 py-2.5 bg-amber-500 text-white rounded-xl font-medium hover:bg-amber-600 transition-colors shadow-sm flex items-center gap-2"
+                >
+                  🔄 立即重试
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {lastError && (
           <div className="bg-red-50 border-b border-red-200 px-6 py-3">
@@ -776,14 +950,28 @@ export default function ChatInterface() {
       {/* 右侧：方案面板 */}
       {showPlanPanel && currentPlan.length > 0 && (
         <div className="w-[420px] bg-white border-l border-gray-200 flex flex-col">
-          <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-gray-800">📋 活动方案</h2>
-            <button
-              onClick={() => setShowPlanPanel(false)}
-              className="text-gray-400 hover:text-gray-600"
-            >
-              ✕
-            </button>
+          <div className="h-20 px-4 border-b border-gray-200 flex items-center justify-between bg-white">
+            <div>
+              <h2 className="text-lg font-semibold text-gray-800">📋 活动方案</h2>
+              <p className="text-xs text-gray-400">{currentPlan.length} 个节点</p>
+            </div>
+            <div className="flex items-center gap-2">
+              {currentPlan.length > 0 && (
+                <button
+                  onClick={() => setShowMatrixView(true)}
+                  className="px-3 py-1.5 bg-gradient-to-r from-indigo-500 to-purple-600 text-white text-xs rounded-lg hover:from-indigo-600 hover:to-purple-700 transition-all flex items-center gap-1 shadow-sm"
+                  title="矩阵视图选择路径"
+                >
+                  🔗 矩阵
+                </button>
+              )}
+              <button
+                onClick={() => setShowPlanPanel(false)}
+                className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-colors text-lg"
+              >
+                ✕
+              </button>
+            </div>
           </div>
 
           {/* 方案工具条 */}
@@ -824,14 +1012,14 @@ export default function ChatInterface() {
                       : 'bg-white border-gray-200'
                   }`}
                 >
-                  {/* 选中复选框（仅可预订且未下单的显示） */}
+                  {/* 选中复选框 — 始终显示（可预订且未下单） */}
                   {isBookable && !isOrdered && (
                     <div className="absolute top-3 right-3 z-10">
                       <input
                         type="checkbox"
                         checked={!!selectedItems[planIndex]}
                         onChange={() => toggleSelectItem(planIndex)}
-                        className="w-4 h-4 cursor-pointer"
+                        className="w-4 h-4 cursor-pointer accent-blue-500"
                       />
                     </div>
                   )}
@@ -843,13 +1031,82 @@ export default function ChatInterface() {
                     </div>
                   )}
 
+                  {/* 替代方案切换箭头 — 右侧 */}
+                  {hasAlts && !isTransport && (
+                    <div className="absolute right-1 top-1/2 -translate-y-1/2 flex flex-col items-center gap-1 z-10">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (switchingAltIndex !== null) return;
+                          const prevIdx = (selectedAltIdx - 1 + alternatives.length) % alternatives.length;
+                          selectAlternative(nonTransportIdx, alternatives[prevIdx].id);
+                        }}
+                        disabled={switchingAltIndex !== null}
+                        className="w-7 h-7 flex items-center justify-center bg-white border border-gray-300 rounded-full text-xs hover:bg-gray-100 transition-all disabled:opacity-30 disabled:cursor-not-allowed shadow-sm"
+                        title="上一个替代方案"
+                      >
+                        ▲
+                      </button>
+                      <span className="text-[10px] text-gray-400 font-mono leading-none">
+                        {selectedAltIdx + 1}/{alternatives.length}
+                      </span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (switchingAltIndex !== null) return;
+                          const nextIdx = (selectedAltIdx + 1) % alternatives.length;
+                          selectAlternative(nonTransportIdx, alternatives[nextIdx].id);
+                        }}
+                        disabled={switchingAltIndex !== null}
+                        className="w-7 h-7 flex items-center justify-center bg-white border border-gray-300 rounded-full text-xs hover:bg-gray-100 transition-all disabled:opacity-30 disabled:cursor-not-allowed shadow-sm"
+                        title="下一个替代方案"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  )}
+
+                  {/* 切换中的加载指示 */}
+                  {switchingAltIndex === nonTransportIdx && (
+                    <div className="absolute inset-0 bg-white/60 rounded-xl flex items-center justify-center z-20">
+                      <div className="animate-spin w-6 h-6 border-2 border-blue-400 border-t-transparent rounded-full"></div>
+                    </div>
+                  )}
+
+                  {/* 交通模式切换箭头 */}
+                  {isTransport && activity.from_location && activity.to_location && (
+                    <div className="absolute right-1 top-1/2 -translate-y-1/2 flex flex-col items-center gap-1 z-10">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); cycleTransportMode(planIndex, 'prev'); }}
+                        className="w-7 h-7 flex items-center justify-center bg-white border border-blue-300 rounded-full text-xs hover:bg-blue-50 transition-all shadow-sm"
+                        title="上一个交通方式"
+                      >
+                        ▲
+                      </button>
+                      <span className="text-[10px] text-blue-400 font-mono leading-none">
+                        {(() => {
+                          const modes = ['walking', 'taxi', 'public_transit', 'driving'];
+                          const idx = modes.indexOf(activity.mode || 'taxi');
+                          return `${idx >= 0 ? idx + 1 : 2}/4`;
+                        })()}
+                      </span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); cycleTransportMode(planIndex, 'next'); }}
+                        className="w-7 h-7 flex items-center justify-center bg-white border border-blue-300 rounded-full text-xs hover:bg-blue-50 transition-all shadow-sm"
+                        title="下一个交通方式"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                  )}
+
                   <div className="flex items-start gap-3">
                     <span className="text-2xl">
                       {isTransport
                         ? getTransportIcon(activity.mode_icon, activity.mode)
                         : getActivityIcon(activity.activity_type)}
                     </span>
-                    <div className="flex-1 pr-8">
+                    <div className={`flex-1 ${(hasAlts && !isTransport) || (isTransport && activity.from_location) ? 'pr-12' : 'pr-8'}`}>
                       <div className="flex items-center gap-2">
                         <span className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded-full">
                           {activity.order}
@@ -939,51 +1196,10 @@ export default function ChatInterface() {
                             <p className="text-xs text-gray-500 mt-2 italic">📝 {activity.notes}</p>
                           )}
 
-                          {/* 替代方案轮播 */}
-                          {hasAlts && (
-                            <div className="mt-3 p-3 bg-gray-50 rounded-lg border border-gray-200">
-                              <div className="flex items-center justify-between mb-2">
-                                <span className="text-xs text-gray-500">💡 替代方案</span>
-                                <span className="text-xs text-gray-400">
-                                  {selectedAltIdx + 1} / {alternatives.length}
-                                </span>
-                              </div>
-                              <div className="flex items-center justify-between gap-2">
-                                <button
-                                  onClick={() => {
-                                    const prevIdx = (selectedAltIdx - 1 + alternatives.length) % alternatives.length;
-                                    selectAlternative(nonTransportIdx, alternatives[prevIdx].id);
-                                  }}
-                                  className="px-2 py-1 bg-white border border-gray-300 rounded text-sm hover:bg-gray-100 transition-colors disabled:opacity-50"
-                                >
-                                  ←
-                                </button>
-                                <div className="flex-1 text-center">
-                                  <div className="text-sm font-medium text-gray-800 truncate">
-                                    {alternatives[selectedAltIdx]?.activity?.name}
-                                  </div>
-                                  {alternatives[selectedAltIdx]?.activity?.details?.price != null &&
-                                   alternatives[selectedAltIdx]?.activity?.details?.price > 0 && (
-                                    <div className="text-xs text-meituan-yellow mt-1">
-                                      ¥{alternatives[selectedAltIdx].activity.details?.price}
-                                    </div>
-                                  )}
-                                  {alternatives[selectedAltIdx]?.llm_score != null && (
-                                    <div className="text-xs text-gray-400">
-                                      评分: {alternatives[selectedAltIdx].llm_score}
-                                    </div>
-                                  )}
-                                </div>
-                                <button
-                                  onClick={() => {
-                                    const nextIdx = (selectedAltIdx + 1) % alternatives.length;
-                                    selectAlternative(nonTransportIdx, alternatives[nextIdx].id);
-                                  }}
-                                  className="px-2 py-1 bg-white border border-gray-300 rounded text-sm hover:bg-gray-100 transition-colors disabled:opacity-50"
-                                >
-                                  →
-                                </button>
-                              </div>
+                          {/* 当前为替代方案的提示标签 */}
+                          {hasAlts && selectedAltIdx > 0 && (
+                            <div className="mt-2 inline-block px-2 py-0.5 bg-purple-100 text-purple-600 text-[10px] rounded-full">
+                              🔄 替代方案 #{selectedAltIdx + 1}
                             </div>
                           )}
                         </>
@@ -995,42 +1211,90 @@ export default function ChatInterface() {
             })}
           </div>
 
-          {/* 底部操作区域 */}
-          <div className="p-4 border-t border-gray-200 space-y-2">
-            {/* 左下角预订按钮 */}
+          {/* 底部操作区域 — 始终可见 */}
+          <div className="p-4 border-t border-gray-200 space-y-3 bg-white">
+            {/* 预订信息 + 全选 */}
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setShowBookingForm(true)}
-                className="px-4 py-2.5 bg-gray-600 text-white text-sm rounded-xl hover:bg-gray-700 transition-colors flex items-center gap-2"
+                className="px-4 py-2.5 bg-gray-600 text-white text-sm rounded-xl hover:bg-gray-700 transition-colors flex items-center gap-2 shadow-sm"
               >
                 📝 填写预订信息
               </button>
               {bookableActivities.length > 0 && (
-                <button
-                  onClick={selectAllUnordered}
-                  className="px-3 py-2.5 bg-white border border-gray-300 text-gray-700 text-sm rounded-xl hover:bg-gray-50 transition-colors"
-                >
-                  全选({unorderedBookable.length})
-                </button>
+                <>
+                  <button
+                    onClick={selectAllUnordered}
+                    className="px-3 py-2.5 bg-blue-50 border border-blue-300 text-blue-700 text-sm rounded-xl hover:bg-blue-100 transition-colors font-medium"
+                  >
+                    全选({unorderedBookable.length})
+                  </button>
+                  {Object.keys(selectedItems).filter(k => selectedItems[Number(k)]).length > 0 && (
+                    <button
+                      onClick={() => setSelectedItems({})}
+                      className="px-3 py-2.5 bg-white border border-gray-300 text-gray-500 text-xs rounded-xl hover:bg-gray-50 transition-colors"
+                    >
+                      取消全选
+                    </button>
+                  )}
+                </>
               )}
             </div>
+
+            {/* 当前选中统计 */}
+            {bookableActivities.length > 0 && (
+              <div className="flex items-center gap-2 text-xs text-gray-500 px-1">
+                <span>已选:</span>
+                {bookableActivities.map(({ activity, index }) => (
+                  <span
+                    key={index}
+                    className={`px-2 py-0.5 rounded-full cursor-pointer transition-all ${
+                      selectedItems[index]
+                        ? 'bg-blue-500 text-white'
+                        : orderedItems[index]
+                          ? 'bg-green-100 text-green-600 line-through'
+                          : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
+                    }`}
+                    onClick={() => {
+                      if (!orderedItems[index]) toggleSelectItem(index);
+                    }}
+                  >
+                    {activity.name.slice(0, 6)}
+                    {orderedItems[index] ? ' ✓' : selectedItems[index] ? ' ✓' : ''}
+                  </span>
+                ))}
+              </div>
+            )}
 
             {/* 一键下单按钮 */}
             {unorderedBookable.length > 0 ? (
               <button
                 onClick={executeSelectedOrders}
-                disabled={Object.keys(selectedItems).filter(k => selectedItems[k]).length === 0}
-                className="w-full py-3 bg-meituan-yellow text-gray-800 rounded-xl font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+                disabled={Object.keys(selectedItems).filter(k => selectedItems[Number(k)]).length === 0}
+                className="w-full py-3 bg-meituan-yellow text-gray-800 rounded-xl font-medium hover:opacity-90 transition-all disabled:opacity-50 shadow-sm flex items-center justify-center gap-2"
               >
-                🎫 一键下单 ({Object.keys(selectedItems).filter(k => selectedItems[k]).length}/{unorderedBookable.length}项)
+                🎫 一键下单 ({Object.keys(selectedItems).filter(k => selectedItems[Number(k)]).length}/{unorderedBookable.length}项)
               </button>
             ) : bookableActivities.length > 0 ? (
-              <div className="w-full py-3 bg-green-100 text-green-700 rounded-xl font-medium text-center">
-                ✓ 所有项目已预订
+              <div className="w-full py-3 bg-green-100 text-green-700 rounded-xl font-medium text-center text-sm">
+                ✓ 所有可预订项目已完成
               </div>
-            ) : null}
+            ) : (
+              <div className="w-full py-3 bg-gray-50 text-gray-400 rounded-xl text-center text-sm">
+                当前方案无需预订项目
+              </div>
+            )}
           </div>
         </div>
+      )}
+
+      {/* 矩阵视图全屏覆盖层 — 不离开当前页面，WebSocket 保持连接 */}
+      {showMatrixView && currentPlan.length > 0 && (
+        <MatrixView
+          plan={currentPlan}
+          planId={currentPlanId}
+          onClose={() => setShowMatrixView(false)}
+        />
       )}
 
       {/* 预订信息表单弹窗 */}

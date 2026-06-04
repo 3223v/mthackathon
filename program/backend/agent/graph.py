@@ -37,7 +37,7 @@ from agent.nodes import (
     full_replan,
 )
 from core.skill_loader import skill_loader
-from utils import logger, agent_logger
+from utils import logger, agent_logger, log_node_io, truncate_for_console
 
 # ==================== 配置路径 ====================
 LLM_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/llm_config.json")
@@ -48,14 +48,16 @@ StreamCallback = Optional[Callable[[str], Awaitable[None]]]
 
 # ==================== LLM 管理器（支持流式） ====================
 class LLMManager:
-    """LLM管理器 — 多LLM轮询 + 自动重试 + token级流式输出"""
+    """LLM管理器 — 双池设计：流式池（前端交互）+ 非流式池（结构化校验）"""
 
     def __init__(self, configs: list):
         self.configs = configs
         self.current_index = 0
+        self.ns_current_index = 0  # 非流式池独立轮询指针
         self.retry_count = 3
         self.retry_delay = 2
-        self.llms = []
+        self.llms = []       # 流式池（streaming=True）
+        self.ns_llms = []    # 非流式池（streaming=False）
         self._init_llms()
 
     def _init_llms(self):
@@ -65,6 +67,7 @@ class LLMManager:
                 logger.warning(f"LLM #{i+1} ({config.get('name', '?')}) API密钥未配置，跳过")
                 continue
             try:
+                # 流式实例（前端实时交互）
                 llm = ChatOpenAI(
                     model=config.get("model", "gpt-4o"),
                     base_url=config.get("base_url"),
@@ -75,7 +78,20 @@ class LLMManager:
                     max_retries=0,
                 )
                 self.llms.append({"llm": llm, "config": config})
-                logger.info(f"LLM #{i+1} 初始化成功 | name={config.get('name')} | model={config.get('model')}")
+
+                # 非流式实例（结构化输出 + 校验）
+                ns_llm = ChatOpenAI(
+                    model=config.get("model", "gpt-4o"),
+                    base_url=config.get("base_url"),
+                    api_key=api_key,
+                    temperature=config.get("temperature", 0.7),
+                    max_tokens=config.get("max_tokens", 4096),
+                    streaming=False,
+                    max_retries=0,
+                )
+                self.ns_llms.append({"llm": ns_llm, "config": config})
+
+                logger.info(f"LLM #{i+1} 初始化成功 (流式+非流式) | name={config.get('name')} | model={config.get('model')}")
             except Exception as e:
                 logger.error(f"LLM #{i+1} 初始化失败 | error={str(e)}")
 
@@ -87,6 +103,14 @@ class LLMManager:
             return None, None
         llm_info = self.llms[self.current_index]
         self.current_index = (self.current_index + 1) % len(self.llms)
+        return llm_info["llm"], llm_info["config"]
+
+    def _get_next_ns_llm(self):
+        """获取下一个非流式 LLM 实例"""
+        if not self.ns_llms:
+            return None, None
+        llm_info = self.ns_llms[self.ns_current_index]
+        self.ns_current_index = (self.ns_current_index + 1) % len(self.ns_llms)
         return llm_info["llm"], llm_info["config"]
 
     async def invoke(self, messages: list, stream_callback: StreamCallback = None) -> str:
@@ -140,6 +164,66 @@ class LLMManager:
                     self.retry_delay *= 1.5
 
         raise Exception(f"所有LLM调用均失败: {str(last_error)}")
+
+    async def invoke_structured(
+        self,
+        messages: list,
+        schema: type,
+    ):
+        """
+        结构化输出调用 — 三层保底策略（使用非流式池）
+
+        Layer 1: Native json_schema + strict=True（优先）
+        Layer 2: Function Calling + tool_choice（备选）
+        Layer 3: 返回 None（调用方降级到文本解析 + 重试）
+
+        Returns:
+            解析后的 Pydantic 对象，或 None
+        """
+        if not self.ns_llms:
+            logger.warning("非流式LLM池为空，无法进行结构化输出")
+            return None
+
+        last_error = None
+
+        for attempt in range(min(self.retry_count, 2)):
+            ns_llm, config = self._get_next_ns_llm()
+            if ns_llm is None:
+                continue
+
+            llm_name = config.get("name", "?")
+
+            # --- Layer 1: Native json_schema ---
+            try:
+                logger.info(f"LLM结构化 [Layer1 json_schema] [{llm_name}] | attempt={attempt+1}")
+                structured_llm = ns_llm.with_structured_output(
+                    schema,
+                    method="json_schema",
+                    strict=True,
+                )
+                result = await structured_llm.ainvoke(messages)
+                if result is not None:
+                    logger.info(f"LLM结构化 [Layer1] 成功 | type={type(result).__name__}")
+                    return result
+            except Exception as e:
+                logger.warning(f"LLM结构化 [Layer1] 失败 | error={str(e)[:120]}")
+
+            # --- Layer 2: Function Calling ---
+            try:
+                logger.info(f"LLM结构化 [Layer2 function_calling] [{llm_name}] | attempt={attempt+1}")
+                structured_llm = ns_llm.with_structured_output(
+                    schema,
+                    method="function_calling",
+                )
+                result = await structured_llm.ainvoke(messages)
+                if result is not None:
+                    logger.info(f"LLM结构化 [Layer2] 成功 | type={type(result).__name__}")
+                    return result
+            except Exception as e:
+                logger.warning(f"LLM结构化 [Layer2] 失败 | error={str(e)[:120]}")
+
+        logger.warning(f"LLM结构化 所有层级失败，降级到文本解析")
+        return None
 
     async def invoke_with_logging(
         self,
@@ -205,39 +289,56 @@ def _get_stream_callback(config: RunnableConfig) -> StreamCallback:
 
 
 async def node_analyze_intent(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
-    logger.info(f"[节点: analyze_intent] 输入: messages_count={len(state.get('messages', []))}")
+    msgs = state.get("messages", [])
+    last_msg = msgs[-1].content[:100] if msgs else ""
+    in_summary = f"messages={len(msgs)}, last='{last_msg}'"
     result = analyze_intent(state)
-    logger.info(f"[节点: analyze_intent] 输出: intent={result.get('intent_type')} | skill={result.get('skill_context', {}).get('id', 'None') if result.get('skill_context') else 'None'}")
+    out_summary = f"intent={result.get('intent_type')}, skill={result.get('skill_context', {}).get('id', 'None') if result.get('skill_context') else 'None'}"
+    log_node_io(logger, "analyze_intent", in_summary, out_summary,
+                full_input=f"messages_count={len(msgs)}\nlast_message={msgs[-1].content if msgs else ''}",
+                full_output=json.dumps({k: v for k, v in result.items() if k not in ('messages', 'plan', 'query_results')}, ensure_ascii=False, indent=2, default=str))
     return result
 
 
 async def node_general_response(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
-    logger.info(f"[节点: general_response] 输入: intent={state.get('intent_type')}")
+    in_summary = f"intent={state.get('intent_type')}"
     result = general_response(state)
-    logger.info(f"[节点: general_response] 输出: response_length={len(result.get('messages', [{}])[0].content) if result.get('messages') else 0}")
+    resp_text = result.get('messages', [{}])[0].content if result.get('messages') else ''
+    out_summary = f"response_len={len(resp_text)}"
+    log_node_io(logger, "general_response", in_summary, out_summary,
+                full_output=f"response:\n{resp_text}")
     return result
 
 
 async def node_extract_preferences(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
-    logger.info(f"[节点: extract_preferences] 输入: has_profile={bool(state.get('user_profile'))}")
+    in_summary = f"has_profile={bool(state.get('user_profile'))}, msgs={len(state.get('messages', []))}"
     result = extract_preferences(state)
     profile = result.get("user_profile", {})
-    logger.info(f"[节点: extract_preferences] 输出: diet={profile.get('diet_preferences')} | budget={profile.get('budget_range')} | relationships={len(profile.get('social_relationships', []))}")
+    out_summary = f"diet={profile.get('diet_preferences')}, budget={profile.get('budget_range')}, rels={len(profile.get('social_relationships', []))}"
+    log_node_io(logger, "extract_preferences", in_summary, out_summary,
+                full_output=json.dumps(profile, ensure_ascii=False, indent=2, default=str))
     return result
 
 
 async def node_query_data(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
-    logger.info(f"[节点: query_data] 输入: skill={state.get('skill_context', {}).get('id', 'None') if state.get('skill_context') else 'None'} | filters_ready={bool(state.get('skill_context'))}")
+    skill_id = state.get('skill_context', {}).get('id', 'None') if state.get('skill_context') else 'None'
+    in_summary = f"skill={skill_id}, has_filters={bool(state.get('skill_context'))}"
     result = query_data(state)
     qr = result.get("query_results", {})
     total = sum(len(v) for v in qr.values())
-    logger.info(f"[节点: query_data] 输出: total_items={total} | attractions={len(qr.get('attractions', []))} | restaurants={len(qr.get('restaurants', []))} | activities={len(qr.get('activities', []))}")
+    out_summary = f"total={total}, attractions={len(qr.get('attractions', []))}, restaurants={len(qr.get('restaurants', []))}, activities={len(qr.get('activities', []))}, cafes={len(qr.get('cafes', []))}"
+    # 记录每个类别的名称列表到文件
+    detail = {cat: [f"{it.get('name','?')}(⭐{it.get('rating','?')})" for it in items[:5]]
+              for cat, items in qr.items() if items}
+    log_node_io(logger, "query_data", in_summary, out_summary,
+                full_output=json.dumps(detail, ensure_ascii=False, indent=2))
     return result
 
 
 async def node_planner(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
-    """规划生成 — 流式输出到前端"""
-    logger.info(f"[节点: planner] 输入: plan_empty={not state.get('plan')} | query_items={sum(len(v) for v in state.get('query_results', {}).values())}")
+    """规划生成 — 流式输出到前端 + 后置校验 + 倒计时重试信号"""
+    qr = state.get("query_results", {})
+    in_summary = f"plan_empty={not state.get('plan')}, query_items={sum(len(v) for v in qr.values())}, is_retry={state.get('planner_parse_failed', False)}"
 
     if not llm_manager.has_llms():
         return {"messages": [AIMessage(content="抱歉，当前没有可用的 LLM 服务。")]}
@@ -246,9 +347,25 @@ async def node_planner(state: AgentState, config: Optional[RunnableConfig] = Non
     result = await generate_plan(state, llm_manager, stream_callback=stream_cb)
 
     plan = result.get("plan", [])
-    logger.info(f"[节点: planner] 输出: plan_length={len(plan)} | plan_id={result.get('plan_id')} | activities={[a.get('name', '?') for a in plan]}")
-    if plan:
-        logger.debug(f"[节点: planner] Plan JSON:\n{json.dumps(plan, ensure_ascii=False, indent=2)}")
+    parse_failed = result.get("planner_parse_failed", False)
+
+    if parse_failed and stream_cb:
+        # 通知前端：JSON 校验失败，启动倒计时重试
+        logger.warning(f"[planner] JSON校验失败，发送倒计时重试信号")
+        await stream_cb(f"\n\n[解析异常，{3}秒后自动重新生成...]")
+        # 发送结构化消息让前端显示倒计时UI
+        try:
+            await stream_cb(json.dumps({
+                "__retry_signal__": True,
+                "countdown": 3,
+                "message": "方案解析异常，即将自动重新生成",
+            }))
+        except Exception:
+            pass
+
+    out_summary = f"plan_len={len(plan)}, plan_id={result.get('plan_id')}, parse_failed={parse_failed}"
+    log_node_io(logger, "planner", in_summary, out_summary,
+                full_output=json.dumps(plan, ensure_ascii=False, indent=2))
     return result
 
 
@@ -256,7 +373,7 @@ async def node_replace_activity(state: AgentState, config: Optional[RunnableConf
     """替换单活动"""
     target = state.get("replan_target", {})
     plan = state.get("plan", [])
-    logger.info(f"[节点: replace_activity] 输入: plan_length={len(plan)} | target={target.get('target_description', '?')[:50]}")
+    in_summary = f"plan_len={len(plan)}, target={target.get('target_description', '?')[:80]}"
 
     if not llm_manager.has_llms():
         return {"messages": [AIMessage(content="抱歉，当前没有可用的 LLM 服务。")]}
@@ -265,14 +382,16 @@ async def node_replace_activity(state: AgentState, config: Optional[RunnableConf
     result = await replace_activity(state, llm_manager, stream_callback=stream_cb)
 
     new_plan = result.get("plan", [])
-    logger.info(f"[节点: replace_activity] 输出: new_plan_length={len(new_plan)}")
+    out_summary = f"new_plan_len={len(new_plan)}, names={[a.get('name','?') for a in new_plan if a.get('activity_type')!='transport']}"
+    log_node_io(logger, "replace_activity", in_summary, out_summary,
+                full_output=json.dumps(new_plan, ensure_ascii=False, indent=2))
     return result
 
 
 async def node_partial_replan(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
     """部分重规划"""
     target = state.get("replan_target", {})
-    logger.info(f"[节点: partial_replan] 输入: plan_length={len(state.get('plan', []))} | start_after_index={target.get('start_after_index')}")
+    in_summary = f"plan_len={len(state.get('plan', []))}, start_after={target.get('start_after_index')}"
 
     if not llm_manager.has_llms():
         return {"messages": [AIMessage(content="抱歉，当前没有可用的 LLM 服务。")]}
@@ -281,15 +400,18 @@ async def node_partial_replan(state: AgentState, config: Optional[RunnableConfig
     result = await partial_replan(state, llm_manager, stream_callback=stream_cb)
 
     new_plan = result.get("plan", [])
-    logger.info(f"[节点: partial_replan] 输出: new_plan_length={len(new_plan)}")
+    out_summary = f"new_plan_len={len(new_plan)}, names={[a.get('name','?') for a in new_plan if a.get('activity_type')!='transport']}"
+    log_node_io(logger, "partial_replan", in_summary, out_summary,
+                full_output=json.dumps(new_plan, ensure_ascii=False, indent=2))
     return result
 
 
 async def node_full_replan(state: AgentState, config: Optional[RunnableConfig] = None) -> dict:
     """全量重规划"""
-    logger.info(f"[节点: full_replan] 输入: old_plan_length={len(state.get('plan', []))}")
+    in_summary = f"old_plan_len={len(state.get('plan', []))}"
     result = await full_replan(state, llm_manager)
-    logger.info(f"[节点: full_replan] 输出: intent={result.get('intent_type')} | plan_cleared={not result.get('plan')}")
+    out_summary = f"intent={result.get('intent_type')}, plan_cleared={not result.get('plan')}"
+    log_node_io(logger, "full_replan", in_summary, out_summary)
     return result
 
 

@@ -22,19 +22,20 @@ class ColoredFormatter(logging.Formatter):
 
 def setup_logger(
     name: str = "agent",
-    level: int = logging.INFO,
+    level: int = logging.DEBUG,
     log_file: Optional[str] = None
 ) -> logging.Logger:
-    """设置日志记录器"""
+    """设置日志记录器 — 控制台INFO级别（简洁），文件DEBUG级别（全量）"""
 
     logger = logging.getLogger(name)
-    logger.setLevel(level)
+    logger.setLevel(logging.DEBUG)  # logger 本身设为 DEBUG，由 handler 控制输出级别
 
     if logger.handlers:
         return logger
 
+    # 控制台 handler：INFO 级别，截取展示
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
+    console_handler.setLevel(logging.INFO)
     console_formatter = ColoredFormatter(
         '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
@@ -47,8 +48,9 @@ def setup_logger(
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
 
+        # 文件 handler：DEBUG 级别，全量保存
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(level)
+        file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter(
             '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
@@ -174,10 +176,42 @@ class APILogger:
 LOG_DIR = os.path.join(os.path.dirname(__file__), "../logs")
 LOG_FILE = os.path.join(LOG_DIR, f"agent_{datetime.now().strftime('%Y%m%d')}.log")
 
-logger = setup_logger("agent", logging.INFO, LOG_FILE)
+logger = setup_logger("agent", logging.DEBUG, LOG_FILE)
 ws_logger = WebSocketLogger()
 agent_logger = AgentLogger()
 api_logger = APILogger()
+
+
+def truncate_for_console(text: str, max_len: int = 200) -> str:
+    """截取文本用于控制台展示"""
+    if not text:
+        return ""
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + f"... [截断，完整内容见日志文件，总长{len(text)}]"
+
+
+def log_node_io(logger_instance, node_name: str, input_summary: str, output_summary: str,
+                full_input: str = "", full_output: str = ""):
+    """
+    记录节点输入输出：控制台截取，文件全量
+
+    Args:
+        logger_instance: logger 实例
+        node_name: 节点名称
+        input_summary: 输入摘要（控制台展示）
+        output_summary: 输出摘要（控制台展示）
+        full_input: 完整输入（写入文件）
+        full_output: 完整输出（写入文件）
+    """
+    logger_instance.info(f"[{node_name}] IN  → {truncate_for_console(input_summary)}")
+    logger_instance.info(f"[{node_name}] OUT ← {truncate_for_console(output_summary)}")
+    if full_input:
+        logger_instance.debug(f"[{node_name}] 完整输入:\n{full_input}")
+    if full_output:
+        logger_instance.debug(f"[{node_name}] 完整输出:\n{full_output}")
+
 
 __all__ = [
     "setup_logger",
@@ -188,5 +222,7 @@ __all__ = [
     "logger",
     "ws_logger",
     "agent_logger",
-    "api_logger"
+    "api_logger",
+    "truncate_for_console",
+    "log_node_io",
 ]

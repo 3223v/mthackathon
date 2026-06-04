@@ -1,4 +1,11 @@
-[
+[  
+  {
+    "name": "meituan",
+    "model": "LongCat-2.0-Preview",
+    "base_url": "https://api.longcat.chat/openai",
+    "api_key": "ak_2aW94e6Dr9XL6eQ8BF2Ax7RN0qf4s",
+    "temperature": 0.2
+  },
   {
     "name": "xiaomi",
     "model": "mimo-v2.5-pro",

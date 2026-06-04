@@ -19,6 +19,7 @@ ws://localhost:8000/ws/chat
 | `message` | 普通消息 | `{"type":"message", "content":"..."}` |
 | `interrupt` | 打断/补充 | `{"type":"interrupt", "content":"..."}` |
 | `retry` | 手动重试 | `{"type":"retry"}` |
+| `retry_planner` | 立即重试规划（跳过倒计时） | `{"type":"retry_planner"}` |
 
 ### 接收事件
 
@@ -27,6 +28,7 @@ ws://localhost:8000/ws/chat
 | `chunk` | LLM 流式 token |
 | `plan` | 结构化方案（含交通活动） |
 | `plan_updated` | 方案已更新 |
+| `plan_validation_failed` | JSON 校验失败，触发倒计时重试（含 `countdown`, `message`） |
 | `ai_message` | 展示文本 |
 | `skill_detected` | 匹配的技能 |
 | `thinking` | 处理进度 |
@@ -173,7 +175,55 @@ Content-Type: application/json
 
 ---
 
-## 6. 下单
+## 6. 二维矩阵（路径选择）v3 新增
+
+### 获取矩阵
+```http
+POST /api/plan/matrix
+Content-Type: application/json
+
+{
+  "plan_id": "plan_xxx",
+  "plan": [...],    // 完整的 plan 数组（含交通节点）
+  "top_k": 3
+}
+```
+
+响应（矩阵结构）：
+```json
+{
+  "plan_id": "plan_xxx",
+  "matrix": [
+    [{ "id": "n0", "label": "故宫", "is_original": true, "activity": {...} },
+     { "id": "n0_alt0", "label": "天坛", "is_original": false, "activity": {...} }],
+    [{ "id": "t1", "label": "打车 22分钟", "is_original": true, "activity": {...}, "transport_info": {...} },
+     { "id": "t1_alt0", "label": "公交 30分钟", "is_original": false, ... }],
+    ...
+  ],
+  "column_labels": ["活动: 故宫", "交通: 打车→海底捞", ...],
+  "column_types": ["activity", "transport", ...]
+}
+```
+
+每一列代表方案中的一个节点位置（含交通），每列内是原始方案 + 替代方案。
+
+### 提交路径
+```http
+POST /api/plan/reroute-matrix
+Content-Type: application/json
+
+{
+  "plan_id": "plan_xxx",
+  "selected_ids": ["n0", "t1_alt1", "n2_alt0"],
+  "matrix": [...]
+}
+```
+
+返回根据选中路径生成的完整 plan。
+
+---
+
+## 7. 下单
 
 先验证：
 ```http
@@ -189,7 +239,7 @@ POST /api/orders/execute/{i}    # 单独
 
 ---
 
-## 7. 打断机制
+## 8. 打断机制
 
 用户随时可以发送 `interrupt` 消息追加信息：
 
@@ -201,7 +251,7 @@ POST /api/orders/execute/{i}    # 单独
 
 ---
 
-## 8. 错误处理与重试
+## 9. 错误处理与重试
 
 错误事件格式：
 ```json

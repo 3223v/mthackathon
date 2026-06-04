@@ -197,10 +197,25 @@ class AgentState(TypedDict):
 
 ## LLM 调用策略
 
-1. **多 LLM 轮询**：配置多个 LLM，轮流调用，失败自动切换
+### 双池设计
+系统初始化时每个 LLM 配置创建两个实例：
+- **流式池** (`self.llms`, `streaming=True`)：前端实时 token 推送
+- **非流式池** (`self.ns_llms`, `streaming=False`)：结构化输出、校验、重试
+
+### 调用策略
+1. **多 LLM 轮询**：两个池各自独立轮询，失败自动切换
 2. **自动重试**：单个 LLM 失败后最多重试 3 次，间隔递增
-3. **流式优先**：所有规划类调用使用流式模式
-4. **日志记录**：每次调用记录完整 system/user prompt 和响应长度
+3. **流式优先**：规划类首次调用使用流式模式，重试使用非流式结构化输出
+4. **三层结构化输出保底**：
+   - **Layer 1**: Native `json_schema` + `strict=True`（OpenAI 原生结构化输出）
+   - **Layer 2**: Function Calling + `tool_choice="required"`（兼容其他模型）
+   - **Layer 3**: 返回 None → 调用方降级到文本解析
+5. **流式 + 后置校验 + 倒计时重试**：
+   - 首次流式输出到前端 → 完成后 `_parse_plan_json()` 校验 JSON
+   - 解析失败 → WebSocket 发送 `plan_validation_failed` 事件（3秒倒计时）
+   - 前端显示琥珀色横幅 + 手动重试按钮
+   - 重试时直接调用 `generate_plan()`（非流式结构化输出），不重新执行整张图
+6. **日志记录**：控制台 INFO 截取展示（200字），文件 DEBUG 全量保存
 
 ---
 
@@ -210,8 +225,9 @@ class AgentState(TypedDict):
 backend/
 ├── main.py                  # FastAPI 入口（WebSocket + REST API）
 ├── agent/
-│   ├── graph.py             # LangGraph 图定义 + LLMManager
+│   ├── graph.py             # LangGraph 图定义 + LLMManager（含结构化输出）
 │   ├── state.py             # AgentState 类型定义
+│   ├── schemas.py           # Pydantic 结构化输出 Schema 定义
 │   └── nodes/
 │       ├── intent.py        # 意图分析 + Skill 匹配
 │       ├── preferences.py   # 偏好提取 + 持久化
@@ -239,6 +255,25 @@ backend/
 └── utils/
     └── logger.py            # 日志系统
 ```
+
+---
+
+### 路径选择（二维矩阵）
+
+```
+POST /api/plan/matrix
+  → 返回 matrix[列][行]（每列=plan中的一个位置，含交通节点）
+  → 每行=原始方案 + Top-K 替代方案
+  → 交通节点也有替代（不同模式）
+
+前端 MatrixView 覆盖层：
+  → 用户每列选一个节点
+  → POST /api/plan/reroute-matrix
+  → 返回完整 plan（含重算的交通）
+  → CustomEvent 回调 → ChatInterface 更新方案
+```
+
+矩阵视图在当前页面内以全屏覆盖层打开，WebSocket 保持连接，不丢失会话状态。
 
 ---
 
